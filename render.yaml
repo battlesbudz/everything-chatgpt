@@ -6,11 +6,3 @@ services:
     buildCommand: npm install --prefix apps/chatgpt
     startCommand: npm --prefix apps/chatgpt run start
     healthCheckPath: /healthz
-services:
-  - type: web
-    name: everything-chatgpt
-    runtime: node
-    plan: free
-    buildCommand: npm install --prefix apps/chatgpt
-    startCommand: npm --prefix apps/chatgpt run start
-    healthCheckPath: /
