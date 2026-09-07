@@ -14,7 +14,25 @@ This is an interactive-decoupled app: the MCP server owns the catalog and the wi
 
 The server only exposes a bounded set of ECG documentation paths. It rejects traversal attempts and truncates returned files to keep tool responses manageable.
 
-The service applies request-size and per-client rate limits, structured request logs, security headers, and an allowlist-based CORS policy. Setting `ECG_ACCESS_TOKEN` enables an optional bearer-token gate for private deployments; the eventual ChatGPT integration should replace that single-token mode with OAuth and per-user authorization.
+The service applies request-size and per-client rate limits, structured request logs, security headers, and an allowlist-based CORS policy. `ECG_ACCESS_TOKEN` remains available as a local/private fallback. For ChatGPT, use the OAuth 2.1 mode described below; it provides MCP protected-resource metadata, PKCE, GitHub identity, short-lived access tokens, and the `ecg:read` scope.
+
+## OAuth configuration
+
+OAuth is deliberately disabled unless `ECG_AUTH_MODE=oauth` is set. Configure these Render environment variables before enabling it:
+
+```text
+ECG_AUTH_MODE=oauth
+ECG_RESOURCE_URL=https://everything-chatgpt.onrender.com
+ECG_OAUTH_ISSUER=https://everything-chatgpt.onrender.com
+ECG_OAUTH_REDIRECT_URIS=https://chatgpt.com/connector_platform_oauth_redirect
+GITHUB_OAUTH_CLIENT_ID=<GitHub OAuth app client ID>
+GITHUB_OAUTH_CLIENT_SECRET=<stored in Render, never committed>
+GITHUB_OAUTH_CALLBACK_URL=https://everything-chatgpt.onrender.com/oauth/github/callback
+```
+
+Create a GitHub OAuth App with the callback URL above. The initial scope is limited to `read:user user:email`; it does not grant repository write access or private-repository access. The MCP endpoint advertises `ecg:read` and returns a `WWW-Authenticate` resource-metadata challenge when a request is unauthenticated.
+
+The current OAuth transaction and token stores are in memory. That is suitable for the first authenticated read-only test, but production use still requires a durable encrypted session/token store before relying on Render restarts or multiple instances.
 
 ## Local development
 
@@ -32,6 +50,6 @@ This is a private developer-mode integration at this stage, not a public directo
 
 ## Render deployment
 
-The repository includes a root `render.yaml` for a free Render web service. Create a new Blueprint from the GitHub repository and select the `everything-chatgpt` service. Render installs the app dependencies, uses its assigned `PORT`, and health-checks `/`.
+The repository includes a root `render.yaml` for a free Render web service. Create a new Blueprint from the GitHub repository and select the `everything-chatgpt` service. Render installs the app dependencies, uses its assigned `PORT`, and health-checks `/healthz`.
 
 The free service may sleep after inactivity, so the first request after a quiet period can be slow. It is suitable for personal testing; production use should add authentication and a persistent deployment.
