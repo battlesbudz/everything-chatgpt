@@ -22,9 +22,9 @@
   </head>
   <body>
     <main>
-      <p class="eyebrow">ECG catalog</p>
+      <p class="eyebrow">Everything ChatGPT</p>
       <h1 id="headline">Everything ChatGPT</h1>
-      <p id="message">Ask ChatGPT to search ECG skills, agents, commands, rules, or guides.</p>
+      <p id="message">Ask ChatGPT to search ECG workflows or inspect a GitHub repository.</p>
       <div id="results"></div>
       <p class="meta" id="meta">ChatGPT app · MCP Apps bridge</p>
     </main>
@@ -37,15 +37,33 @@
       function render(output) {
         if (!output) return;
         headline.textContent = output.headline || "Everything ChatGPT";
-        message.textContent = output.message || (output.content ? `Loaded ${output.itemId}` : "Ask ChatGPT to search the ECG catalog.");
+        message.textContent = output.message || (output.content ? `Loaded ${output.itemId || output.path || "result"}` : "Ask ChatGPT to search ECG or inspect GitHub.");
         results.replaceChildren();
         if (Array.isArray(output.results)) {
           for (const item of output.results) {
             const card = document.createElement("article");
             card.className = "result";
-            card.innerHTML = `<strong>${escapeHtml(item.title)}</strong><code>${escapeHtml(item.kind)} · ${escapeHtml(item.id)}</code><p>${escapeHtml(item.snippet || "")}</p>`;
+            const title = item.title || item.fullName || item.name || item.path || "Result";
+            const code = item.kind ? `${item.kind} · ${item.id}` : (item.language || item.type || "GitHub");
+            const detail = item.snippet || item.description || item.url || "";
+            card.innerHTML = `<strong>${escapeHtml(title)}</strong><code>${escapeHtml(code)}</code><p>${escapeHtml(detail)}</p>`;
             results.append(card);
           }
+        }
+        if (Array.isArray(output.entries)) {
+          for (const entry of output.entries) {
+            const card = document.createElement("article");
+            card.className = "result";
+            card.innerHTML = `<strong>${escapeHtml(entry.path)}</strong><code>${escapeHtml(entry.type || "file")} · ${escapeHtml(entry.sha || "")}</code><p>${entry.size == null ? "" : `${escapeHtml(entry.size)} bytes`}</p>`;
+            results.append(card);
+          }
+        }
+        if (output.repository) {
+          const repository = output.repository;
+          const card = document.createElement("article");
+          card.className = "result";
+          card.innerHTML = `<strong>${escapeHtml(repository.fullName)}</strong><code>${escapeHtml(repository.private ? "private" : "public")} · default branch ${escapeHtml(repository.defaultBranch)}</code><p>${escapeHtml(repository.description || "")}</p>`;
+          results.append(card);
         }
         if (output.content) {
           const pre = document.createElement("pre");
