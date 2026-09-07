@@ -24,6 +24,8 @@ npm run dev
 
 The MCP endpoint is `http://localhost:8787/mcp`. To test from ChatGPT, expose it through a public HTTPS tunnel, add the resulting `/mcp` URL as a developer-mode app under ChatGPT settings, then refresh the app after changing tools or widget metadata.
 
+Run the deployed smoke test from the repository root with `npm run app:test`. Set `ECG_MCP_URL` to test another deployment.
+
 This is a private developer-mode integration at this stage, not a public directory submission.
 
 ## Render deployment
