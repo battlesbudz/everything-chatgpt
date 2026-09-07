@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Everything ChatGPT</title>
+    <style>
+      :root { color: #172033; font-family: Inter, system-ui, sans-serif; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; padding: 14px; background: #f7f9fc; }
+      main { max-width: 640px; margin: auto; padding: 18px; border: 1px solid #dfe5ef; border-radius: 16px; background: #fff; }
+      h1 { margin: 0 0 8px; font-size: 21px; }
+      p { line-height: 1.45; }
+      .eyebrow { margin: 0 0 6px; color: #60708a; font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+      .meta { color: #60708a; font-size: 12px; }
+      .result { margin-top: 10px; padding: 11px; border: 1px solid #e4e9f1; border-radius: 11px; }
+      .result strong { display: block; margin-bottom: 4px; }
+      .result code { color: #536783; font-size: 11px; }
+      .result p { margin: 5px 0 0; color: #4d5c73; font-size: 12px; }
+      pre { max-height: 360px; overflow: auto; padding: 12px; border-radius: 10px; background: #f2f5f9; white-space: pre-wrap; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">ECG catalog</p>
+      <h1 id="headline">Everything ChatGPT</h1>
+      <p id="message">Ask ChatGPT to search ECG skills, agents, commands, rules, or guides.</p>
+      <div id="results"></div>
+      <p class="meta" id="meta">ChatGPT app · MCP Apps bridge</p>
+    </main>
+    <script type="module">
+      const headline = document.querySelector("#headline");
+      const message = document.querySelector("#message");
+      const results = document.querySelector("#results");
+      const meta = document.querySelector("#meta");
+
+      function render(output) {
+        if (!output) return;
+        headline.textContent = output.headline || "Everything ChatGPT";
+        message.textContent = output.message || (output.content ? `Loaded ${output.itemId}` : "Ask ChatGPT to search the ECG catalog.");
+        results.replaceChildren();
+        if (Array.isArray(output.results)) {
+          for (const item of output.results) {
+            const card = document.createElement("article");
+            card.className = "result";
+            card.innerHTML = `<strong>${escapeHtml(item.title)}</strong><code>${escapeHtml(item.kind)} · ${escapeHtml(item.id)}</code><p>${escapeHtml(item.snippet || "")}</p>`;
+            results.append(card);
+          }
+        }
+        if (output.content) {
+          const pre = document.createElement("pre");
+          pre.textContent = output.content;
+          results.append(pre);
+        }
+        meta.textContent = `ChatGPT app · ${window.openai ? "MCP Apps bridge + ChatGPT host" : "MCP Apps bridge"}`;
+      }
+
+      function escapeHtml(value) {
+        return String(value).replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[character]);
+      }
+
+      window.addEventListener("message", (event) => {
+        if (event.source !== window.parent || event.data?.jsonrpc !== "2.0") return;
+        const params = event.data.params;
+        const output = params?.structuredContent || params?.toolOutput || params?.result?.structuredContent;
+        if (output) render(output);
+      });
+      if (window.openai?.toolOutput) render(window.openai.toolOutput);
+    </script>
+  </body>
+</html>
