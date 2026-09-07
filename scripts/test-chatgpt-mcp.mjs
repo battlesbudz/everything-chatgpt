@@ -1,11 +1,19 @@
 const baseUrl = (process.env.ECG_MCP_URL ?? "https://everything-chatgpt.onrender.com/mcp").replace(/\/$/, "");
+const bearerToken = process.env.ECG_MCP_BEARER_TOKEN?.trim();
 
 async function call(payload) {
+  const headers = { "content-type": "application/json", accept: "application/json, text/event-stream" };
+  if (bearerToken) headers.authorization = `Bearer ${bearerToken}`;
   const response = await fetch(baseUrl, {
     method: "POST",
-    headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+    headers,
     body: JSON.stringify(payload),
   });
+  if (response.status === 401) {
+    const challenge = response.headers.get("www-authenticate") ?? "";
+    if (!challenge.includes("oauth-protected-resource")) throw new Error("unauthenticated MCP response did not advertise OAuth metadata");
+    return null;
+  }
   if (!response.ok) throw new Error(`${payload.method} returned HTTP ${response.status}`);
   return response.json();
 }
@@ -26,6 +34,10 @@ const initialized = await call({
   method: "initialize",
   params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "ecg-smoke-test", version: "1.0.0" } },
 });
+if (!initialized) {
+  console.log(JSON.stringify({ ok: true, baseUrl, protected: true, message: "MCP correctly requires OAuth before tool access." }));
+  process.exit(0);
+}
 if (initialized.result?.serverInfo?.name !== "everything-chatgpt") throw new Error("unexpected MCP server identity");
 
 const tools = await call({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
