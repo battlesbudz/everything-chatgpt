@@ -25,6 +25,21 @@ const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX_REQUESTS = 120;
 const MCP_METHODS = new Set(["GET", "POST", "DELETE"]);
 const ACCESS_TOKEN = process.env.ECG_ACCESS_TOKEN?.trim();
+const AUTH_MODE = process.env.ECG_AUTH_MODE?.trim().toLowerCase() ?? "anonymous";
+const OAUTH_ENABLED = AUTH_MODE === "oauth";
+const PUBLIC_RESOURCE_URL = (process.env.ECG_RESOURCE_URL?.trim() || "https://everything-chatgpt.onrender.com").replace(/\/$/, "");
+const OAUTH_ISSUER = (process.env.ECG_OAUTH_ISSUER?.trim() || PUBLIC_RESOURCE_URL).replace(/\/$/, "");
+const GITHUB_CLIENT_ID = process.env.GITHUB_OAUTH_CLIENT_ID?.trim() ?? "";
+const GITHUB_CLIENT_SECRET = process.env.GITHUB_OAUTH_CLIENT_SECRET?.trim() ?? "";
+const GITHUB_CALLBACK_URL = process.env.GITHUB_OAUTH_CALLBACK_URL?.trim() || `${PUBLIC_RESOURCE_URL}/oauth/github/callback`;
+const OAUTH_SCOPES = ["ecg:read"] as const;
+const OAUTH_CODE_TTL_MS = 5 * 60_000;
+const OAUTH_TOKEN_TTL_MS = 60 * 60_000;
+const OAUTH_REFRESH_TTL_MS = 30 * 24 * 60 * 60_000;
+const oauthStates = new Map<string, OAuthState>();
+const oauthCodes = new Map<string, OAuthCode>();
+const oauthAccessTokens = new Map<string, OAuthToken>();
+const oauthRefreshTokens = new Map<string, OAuthRefreshToken>();
 const ALLOWED_ORIGINS = new Set(
   (process.env.ECG_ALLOWED_ORIGINS ?? "https://chatgpt.com,https://www.chatgpt.com,https://chat.openai.com,http://localhost:3000,http://localhost:8787")
     .split(",")
@@ -48,6 +63,20 @@ type ToolResult = {
   structuredContent: Record<string, unknown>;
   _meta?: Record<string, unknown>;
 };
+
+type GitHubIdentity = { id: number; login: string; name?: string | null; email?: string | null };
+type OAuthState = {
+  clientId: string;
+  redirectUri: string;
+  scope: string;
+  resource: string;
+  codeChallenge: string;
+  state?: string;
+  createdAt: number;
+};
+type OAuthCode = OAuthState & { identity: GitHubIdentity; used: boolean };
+type OAuthToken = { identity: GitHubIdentity; scope: string; resource: string; expiresAt: number };
+type OAuthRefreshToken = { identity: GitHubIdentity; scope: string; resource: string; expiresAt: number };
 
 function statSafe(filePath: string) {
   try {
@@ -217,6 +246,80 @@ function logEvent(event: string, fields: Record<string, unknown> = {}) {
   console.log(JSON.stringify({ event, timestamp: new Date().toISOString(), ...fields }));
 }
 
+function randomToken(): string {
+  return crypto.randomBytes(32).toString("base64url");
+}
+
+function oauthConfigured(): boolean {
+  return OAUTH_ENABLED && Boolean(GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET && GITHUB_CALLBACK_URL);
+}
+
+function oauthError(res: ServerResponse, status: number, error: string, description: string, redirectUri?: string, state?: string) {
+  if (redirectUri) {
+    const redirect = new URL(redirectUri);
+    redirect.searchParams.set("error", error);
+    redirect.searchParams.set("error_description", description);
+    if (state) redirect.searchParams.set("state", state);
+    res.writeHead(302, { location: redirect.toString() }).end();
+    return;
+  }
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8" }).end(JSON.stringify({ error, error_description: description }));
+}
+
+function normalizeScope(scope: string | null): string {
+  const requested = (scope ?? OAUTH_SCOPES.join(" ")).split(/\s+/).filter(Boolean);
+  return Array.from(new Set(requested.filter((item) => OAUTH_SCOPES.includes(item as typeof OAUTH_SCOPES[number])))).join(" ") || OAUTH_SCOPES[0];
+}
+
+function isAllowedOAuthRedirect(uri: string): boolean {
+  const configured = (process.env.ECG_OAUTH_REDIRECT_URIS ?? "https://chatgpt.com/connector_platform_oauth_redirect,https://chatgpt.com/connector/oauth/")
+    .split(",").map((item) => item.trim()).filter(Boolean);
+  return configured.some((allowed) => allowed.endsWith("/") ? uri.startsWith(allowed) : uri === allowed);
+}
+
+async function exchangeGitHubCode(code: string): Promise<GitHubIdentity> {
+  const tokenResponse = await fetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: { accept: "application/json", "content-type": "application/json" },
+    body: JSON.stringify({ client_id: GITHUB_CLIENT_ID, client_secret: GITHUB_CLIENT_SECRET, code, redirect_uri: GITHUB_CALLBACK_URL }),
+  });
+  if (!tokenResponse.ok) throw new Error(`GitHub token exchange failed with ${tokenResponse.status}`);
+  const tokenPayload = await tokenResponse.json() as { access_token?: string; error?: string };
+  if (!tokenPayload.access_token) throw new Error(tokenPayload.error || "GitHub did not return an access token.");
+
+  const headers = { accept: "application/vnd.github+json", authorization: `Bearer ${tokenPayload.access_token}`, "x-github-api-version": "2022-11-28" };
+  const userResponse = await fetch("https://api.github.com/user", { headers });
+  if (!userResponse.ok) throw new Error(`GitHub identity lookup failed with ${userResponse.status}`);
+  const user = await userResponse.json() as { id: number; login: string; name?: string | null; email?: string | null };
+  return { id: user.id, login: user.login, name: user.name, email: user.email };
+}
+
+function protectedResourceMetadata() {
+  return {
+    resource: PUBLIC_RESOURCE_URL,
+    authorization_servers: [OAUTH_ISSUER],
+    scopes_supported: [...OAUTH_SCOPES],
+    resource_documentation: `${PUBLIC_RESOURCE_URL}/`,
+  };
+}
+
+function authorizationServerMetadata() {
+  return {
+    issuer: OAUTH_ISSUER,
+    authorization_response_iss_parameter_supported: true,
+    authorization_endpoint: `${OAUTH_ISSUER}/oauth/authorize`,
+    token_endpoint: `${OAUTH_ISSUER}/oauth/token`,
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none"],
+    client_id_metadata_document_supported: true,
+    scopes_supported: [...OAUTH_SCOPES],
+  };
+}
+
+function sendJson(res: ServerResponse, status: number, payload: unknown, extraHeaders: Record<string, string> = {}) {
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...extraHeaders }).end(JSON.stringify(payload));
+}
+
 function applySecurityHeaders(req: IncomingMessage, res: ServerResponse) {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "no-referrer");
@@ -245,13 +348,133 @@ function isRateLimited(req: IncomingMessage): boolean {
   return current.count > RATE_LIMIT_MAX_REQUESTS;
 }
 
-function hasValidAccessToken(req: IncomingMessage): boolean {
-  if (!ACCESS_TOKEN) return true;
+function bearerToken(req: IncomingMessage): string {
   const authorization = req.headers.authorization ?? "";
-  const presented = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
+  return authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
+}
+
+function hasValidAccessToken(req: IncomingMessage): boolean {
+  if (OAUTH_ENABLED) {
+    const token = oauthAccessTokens.get(bearerToken(req));
+    return Boolean(token && token.expiresAt > Date.now() && token.resource === PUBLIC_RESOURCE_URL && token.scope.split(" ").includes("ecg:read"));
+  }
+  if (!ACCESS_TOKEN) return true;
+  const presented = bearerToken(req);
   const expected = Buffer.from(ACCESS_TOKEN);
   const actual = Buffer.from(presented);
   return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk: string) => { body += chunk; if (Buffer.byteLength(body) > MAX_REQUEST_BYTES) reject(new Error("Request too large")); });
+    req.on("end", () => resolve(body));
+    req.on("error", reject);
+  });
+}
+
+async function handleOAuth(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
+  if (url.pathname === "/.well-known/oauth-protected-resource" || url.pathname === `${MCP_PATH}/.well-known/oauth-protected-resource`) {
+    sendJson(res, 200, protectedResourceMetadata());
+    return true;
+  }
+  if (url.pathname === "/.well-known/oauth-authorization-server" || url.pathname === "/.well-known/openid-configuration") {
+    sendJson(res, 200, authorizationServerMetadata());
+    return true;
+  }
+  if (!OAUTH_ENABLED) return false;
+  if (!oauthConfigured()) {
+    if (url.pathname.startsWith("/oauth/")) sendJson(res, 503, { error: "temporarily_unavailable", error_description: "OAuth is enabled but its GitHub credentials are not configured." });
+    return url.pathname.startsWith("/oauth/");
+  }
+
+  if (req.method === "GET" && url.pathname === "/oauth/authorize") {
+    const clientId = url.searchParams.get("client_id") ?? "";
+    const redirectUri = url.searchParams.get("redirect_uri") ?? "";
+    const responseType = url.searchParams.get("response_type");
+    const codeChallenge = url.searchParams.get("code_challenge") ?? "";
+    const method = url.searchParams.get("code_challenge_method");
+    const resource = url.searchParams.get("resource") ?? PUBLIC_RESOURCE_URL;
+    const scope = normalizeScope(url.searchParams.get("scope"));
+    const state = url.searchParams.get("state") ?? undefined;
+    if (responseType !== "code" || !clientId || !redirectUri || !isAllowedOAuthRedirect(redirectUri) || !codeChallenge || method !== "S256" || resource !== PUBLIC_RESOURCE_URL) {
+      oauthError(res, 400, "invalid_request", "A valid authorization-code request with PKCE and the registered resource is required.", isAllowedOAuthRedirect(redirectUri) ? redirectUri : undefined, state);
+      return true;
+    }
+    const oauthState = randomToken();
+    oauthStates.set(oauthState, { clientId, redirectUri, scope, resource, codeChallenge, state, createdAt: Date.now() });
+    const github = new URL("https://github.com/login/oauth/authorize");
+    github.searchParams.set("client_id", GITHUB_CLIENT_ID);
+    github.searchParams.set("redirect_uri", GITHUB_CALLBACK_URL);
+    github.searchParams.set("scope", "read:user user:email");
+    github.searchParams.set("state", oauthState);
+    res.writeHead(302, { location: github.toString() }).end();
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/oauth/github/callback") {
+    const stateKey = url.searchParams.get("state") ?? "";
+    const pending = oauthStates.get(stateKey);
+    oauthStates.delete(stateKey);
+    if (!pending || pending.createdAt + OAUTH_CODE_TTL_MS < Date.now()) {
+      res.writeHead(400, { "content-type": "text/plain; charset=utf-8" }).end("OAuth state expired or invalid.");
+      return true;
+    }
+    const githubError = url.searchParams.get("error");
+    if (githubError) { oauthError(res, 400, githubError, url.searchParams.get("error_description") || "GitHub authorization was denied.", pending.redirectUri, pending.state); return true; }
+    try {
+      const identity = await exchangeGitHubCode(url.searchParams.get("code") ?? "");
+      const authorizationCode = randomToken();
+      oauthCodes.set(authorizationCode, { ...pending, identity, used: false });
+      const redirect = new URL(pending.redirectUri);
+      redirect.searchParams.set("code", authorizationCode);
+      if (pending.state) redirect.searchParams.set("state", pending.state);
+      redirect.searchParams.set("iss", OAUTH_ISSUER);
+      res.writeHead(302, { location: redirect.toString() }).end();
+    } catch (error) {
+      logEvent("oauth.github_error", { error: error instanceof Error ? error.message : String(error) });
+      oauthError(res, 502, "server_error", "GitHub authentication could not be completed.", pending.redirectUri, pending.state);
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/oauth/token") {
+    let params: URLSearchParams;
+    try { params = new URLSearchParams(await readBody(req)); } catch { sendJson(res, 413, { error: "invalid_request" }); return true; }
+    const grantType = params.get("grant_type");
+    const resource = params.get("resource") ?? PUBLIC_RESOURCE_URL;
+    if (resource !== PUBLIC_RESOURCE_URL) { sendJson(res, 400, { error: "invalid_target" }); return true; }
+    if (grantType === "authorization_code") {
+      const code = params.get("code") ?? "";
+      const verifier = params.get("code_verifier") ?? "";
+      const pending = oauthCodes.get(code);
+      const digest = crypto.createHash("sha256").update(verifier).digest("base64url");
+      if (!pending || pending.used || pending.createdAt + OAUTH_CODE_TTL_MS < Date.now() || digest !== pending.codeChallenge || params.get("redirect_uri") !== pending.redirectUri) {
+        sendJson(res, 400, { error: "invalid_grant" });
+        return true;
+      }
+      pending.used = true;
+      const accessToken = randomToken();
+      const refreshToken = randomToken();
+      oauthAccessTokens.set(accessToken, { identity: pending.identity, scope: pending.scope, resource, expiresAt: Date.now() + OAUTH_TOKEN_TTL_MS });
+      oauthRefreshTokens.set(refreshToken, { identity: pending.identity, scope: pending.scope, resource, expiresAt: Date.now() + OAUTH_REFRESH_TTL_MS });
+      sendJson(res, 200, { token_type: "Bearer", access_token: accessToken, expires_in: OAUTH_TOKEN_TTL_MS / 1000, refresh_token: refreshToken, scope: pending.scope });
+      return true;
+    }
+    if (grantType === "refresh_token") {
+      const previous = oauthRefreshTokens.get(params.get("refresh_token") ?? "");
+      if (!previous || previous.expiresAt < Date.now()) { sendJson(res, 400, { error: "invalid_grant" }); return true; }
+      const accessToken = randomToken();
+      oauthAccessTokens.set(accessToken, { identity: previous.identity, scope: previous.scope, resource, expiresAt: Date.now() + OAUTH_TOKEN_TTL_MS });
+      sendJson(res, 200, { token_type: "Bearer", access_token: accessToken, expires_in: OAUTH_TOKEN_TTL_MS / 1000, scope: previous.scope });
+      return true;
+    }
+    sendJson(res, 400, { error: "unsupported_grant_type" });
+    return true;
+  }
+  return false;
 }
 
 createServer(async (req, res) => {
@@ -264,12 +487,17 @@ createServer(async (req, res) => {
   logEvent("request.started", { id, method: req.method, path: url.pathname });
   res.on("finish", () => logEvent("request.finished", { id, method: req.method, path: url.pathname, status: res.statusCode, durationMs: Date.now() - startedAt }));
 
+  if (await handleOAuth(req, res, url)) return;
+
   if (isMcpRoute && req.method !== "OPTIONS" && isRateLimited(req)) {
     res.writeHead(429, { "content-type": "text/plain; charset=utf-8", "retry-after": "60" }).end("Rate limit exceeded");
     return;
   }
   if (isMcpRoute && req.method !== "OPTIONS" && !hasValidAccessToken(req)) {
-    res.writeHead(401, { "content-type": "text/plain; charset=utf-8", "www-authenticate": "Bearer" }).end("Authentication required");
+    const challenge = OAUTH_ENABLED
+      ? `Bearer resource_metadata="${PUBLIC_RESOURCE_URL}/.well-known/oauth-protected-resource", scope="ecg:read"`
+      : "Bearer";
+    res.writeHead(401, { "content-type": "text/plain; charset=utf-8", "www-authenticate": challenge }).end("Authentication required");
     return;
   }
 
