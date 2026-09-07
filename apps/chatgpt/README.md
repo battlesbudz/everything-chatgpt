@@ -14,6 +14,8 @@ This is an interactive-decoupled app: the MCP server owns the catalog and the wi
 
 The server only exposes a bounded set of ECG documentation paths. It rejects traversal attempts and truncates returned files to keep tool responses manageable.
 
+The service applies request-size and per-client rate limits, structured request logs, security headers, and an allowlist-based CORS policy. Setting `ECG_ACCESS_TOKEN` enables an optional bearer-token gate for private deployments; the eventual ChatGPT integration should replace that single-token mode with OAuth and per-user authorization.
+
 ## Local development
 
 ```bash
