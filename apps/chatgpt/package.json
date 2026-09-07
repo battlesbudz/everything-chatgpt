@@ -6,7 +6,8 @@
     "dev": "node --import tsx src/server.ts",
     "start": "node --import tsx src/server.ts",
     "check": "tsc --noEmit",
-    "test:remote": "node ../../scripts/test-chatgpt-mcp.mjs"
+    "test:remote": "node ../../scripts/test-chatgpt-mcp.mjs",
+    "test:github": "node ../../scripts/test-chatgpt-github.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/ext-apps": "^1.0.1",
