@@ -29,4 +29,8 @@ for (const expected of ["ecg_overview", "search", "fetch"]) {
   if (!toolNames.includes(expected)) throw new Error(`missing tool: ${expected}`);
 }
 
-console.log(JSON.stringify({ ok: true, baseUrl, server: initialized.result.serverInfo, tools: toolNames }));
+const resources = await call({ jsonrpc: "2.0", id: 3, method: "resources/list", params: {} });
+const resourceUris = (resources.result?.resources ?? []).map((resource) => resource.uri);
+if (!resourceUris.includes("ui://widget/ecg-catalog-v1.html")) throw new Error("missing ECG widget resource");
+
+console.log(JSON.stringify({ ok: true, baseUrl, server: initialized.result.serverInfo, tools: toolNames, resources: resourceUris }));
