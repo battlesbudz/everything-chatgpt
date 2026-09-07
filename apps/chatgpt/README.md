@@ -11,10 +11,14 @@ This is an interactive-decoupled app: the MCP server owns the catalog and the wi
 - `ecg_overview` — explain the ECG harness and show the catalog counts.
 - `search` — search skills, agents, commands, contexts, rules, and guides.
 - `fetch` — read one catalog item returned by `search`.
+- `github_search_repositories` — search GitHub repositories using the authenticated user’s GitHub access.
+- `github_get_repository` — inspect repository metadata.
+- `github_list_tree` — list a bounded repository tree for a branch, tag, or commit.
+- `github_read_file` — read a bounded text file without executing it.
 
 The server only exposes a bounded set of ECG documentation paths. It rejects traversal attempts and truncates returned files to keep tool responses manageable.
 
-The service applies request-size and per-client rate limits, structured request logs, security headers, and an allowlist-based CORS policy. `ECG_ACCESS_TOKEN` remains available as a local/private fallback. For ChatGPT, use the OAuth 2.1 mode described below; it provides MCP protected-resource metadata, PKCE, GitHub identity, short-lived access tokens, and the `ecg:read` scope.
+The service applies request-size and per-client rate limits, structured request logs, security headers, and an allowlist-based CORS policy. `ECG_ACCESS_TOKEN` remains available as a local/private fallback. For ChatGPT, use the OAuth 2.1 mode described below; it provides MCP protected-resource metadata, PKCE, GitHub identity, short-lived access tokens, and the `ecg:read` scope. GitHub OAuth tokens are used only for the read-only GitHub tools in this phase; no write scopes are requested.
 
 ## OAuth configuration
 
