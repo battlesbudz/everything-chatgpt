@@ -116,7 +116,7 @@ def interactive_select(
     if providers is None:
         providers = [
             ("claude", "Anthropic Claude ( Sonnet, Opus, Haiku)"),
-            ("openai", "OpenAI GPT (4o, 4o-mini, 3.5-turbo)"),
+            ("openai", "ChatGPT / OpenAI GPT (4o, 4o-mini, 3.5-turbo)"),
             ("ollama", "Local Ollama models"),
         ]
 
