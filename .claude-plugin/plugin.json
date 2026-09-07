@@ -1,13 +1,13 @@
 {
   "name": "ecc",
   "version": "2.2.1",
-  "description": "Harness-native ECC plugin for engineering teams - 68 agents, 286 skills, 94 legacy command shims, reusable hooks, rules, MCP conventions, and operator workflows for Claude Code plus adjacent agent harnesses",
+  "description": "Compatibility adapter for the Everything ChatGPT harness: agents, skills, commands, hooks, rules, MCP conventions, and operator workflows for Claude Code and adjacent harnesses",
   "author": {
     "name": "Affaan Mustafa",
     "url": "https://x.com/affaanmustafa"
   },
-  "homepage": "https://ecc.tools",
-  "repository": "https://github.com/affaan-m/ECC",
+  "homepage": "https://github.com/battlesbudz/everything-chatgpt#readme",
+  "repository": "https://github.com/battlesbudz/everything-chatgpt",
   "license": "MIT",
   "keywords": [
     "claude-code",
