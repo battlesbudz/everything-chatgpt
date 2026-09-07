@@ -25,3 +25,9 @@ npm run dev
 The MCP endpoint is `http://localhost:8787/mcp`. To test from ChatGPT, expose it through a public HTTPS tunnel, add the resulting `/mcp` URL as a developer-mode app under ChatGPT settings, then refresh the app after changing tools or widget metadata.
 
 This is a private developer-mode integration at this stage, not a public directory submission.
+
+## Render deployment
+
+The repository includes a root `render.yaml` for a free Render web service. Create a new Blueprint from the GitHub repository and select the `everything-chatgpt` service. Render installs the app dependencies, uses its assigned `PORT`, and health-checks `/`.
+
+The free service may sleep after inactivity, so the first request after a quiet period can be slow. It is suitable for personal testing; production use should add authentication and a persistent deployment.
