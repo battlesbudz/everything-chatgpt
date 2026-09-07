@@ -440,9 +440,9 @@ test('codex plugin.json has interface.displayName', () => {
   assert.ok(codexPlugin.interface && codexPlugin.interface.displayName, 'Expected interface.displayName for plugin directory presentation');
 });
 
-test('codex plugin.json uses canonical ECC repo and display name', () => {
-  assert.strictEqual(codexPlugin.repository, 'https://github.com/affaan-m/ECC');
-  assert.strictEqual(codexPlugin.interface.displayName, 'ECC');
+test('codex plugin.json uses the ECG fork repo and display name', () => {
+  assert.strictEqual(codexPlugin.repository, 'https://github.com/battlesbudz/everything-chatgpt');
+  assert.strictEqual(codexPlugin.interface.displayName, 'Everything ChatGPT');
 });
 
 test('codex plugin presentation assets exist and ship in npm package', () => {
