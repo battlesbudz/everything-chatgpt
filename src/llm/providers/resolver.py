@@ -49,6 +49,9 @@ def _read_saved_llm_config(env_path: str | Path = LLM_ENV_FILE) -> dict[str, str
 
 def _resolve_provider_type(provider_type: ProviderType | str | None) -> ProviderType | str:
     if provider_type is not None:
+        # ChatGPT is the product-facing name for the OpenAI-compatible provider.
+        if isinstance(provider_type, str) and provider_type.strip().lower() == "chatgpt":
+            return ProviderType.OPENAI
         return provider_type
 
     env_provider = os.environ.get("LLM_PROVIDER")
@@ -56,7 +59,13 @@ def _resolve_provider_type(provider_type: ProviderType | str | None) -> Provider
         return _strip_env_value(env_provider).lower()
 
     saved_config = _read_saved_llm_config()
-    return saved_config.get("LLM_PROVIDER", "claude").lower()
+    saved_provider = saved_config.get("LLM_PROVIDER")
+    if saved_provider:
+        return "openai" if saved_provider.lower() == "chatgpt" else saved_provider.lower()
+
+    # ChatGPT-first default when an OpenAI credential is available; preserve the
+    # upstream Claude default for installations that have not configured OpenAI.
+    return "openai" if os.environ.get("OPENAI_API_KEY") else "claude"
 
 
 def get_provider(provider_type: ProviderType | str | None = None, **kwargs: str) -> LLMProvider:
