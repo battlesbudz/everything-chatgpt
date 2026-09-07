@@ -15,6 +15,11 @@ if (!health.ok) throw new Error(`health check returned HTTP ${health.status}`);
 const healthBody = await health.json();
 if (healthBody.status !== "ok") throw new Error("health check did not report ok");
 
+const resourceMetadata = await fetch(baseUrl.replace(/\/mcp$/, "/.well-known/oauth-protected-resource"));
+if (!resourceMetadata.ok) throw new Error(`OAuth protected-resource metadata returned HTTP ${resourceMetadata.status}`);
+const resourceMetadataBody = await resourceMetadata.json();
+if (!Array.isArray(resourceMetadataBody.authorization_servers)) throw new Error("OAuth metadata is missing authorization_servers");
+
 const initialized = await call({
   jsonrpc: "2.0",
   id: 1,
