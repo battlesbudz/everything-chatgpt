@@ -21,13 +21,17 @@ const WIDGET_HTML = readFileSync(path.join(APP_ROOT, "public", "widget.html"), "
 const MAX_RESULTS = 20;
 const MAX_FILE_CHARS = 16_000;
 const MAX_REQUEST_BYTES = 1_000_000;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_REQUESTS = 120;
 const MCP_METHODS = new Set(["GET", "POST", "DELETE"]);
+const ACCESS_TOKEN = process.env.ECG_ACCESS_TOKEN?.trim();
 const ALLOWED_ORIGINS = new Set(
   (process.env.ECG_ALLOWED_ORIGINS ?? "https://chatgpt.com,https://www.chatgpt.com,https://chat.openai.com,http://localhost:3000,http://localhost:8787")
     .split(",")
     .map((origin) => origin.trim())
     .filter(Boolean),
 );
+const rateLimits = new Map<string, { count: number; resetAt: number }>();
 
 const ALLOWED_ROOTS = ["agents", "commands", "contexts", "docs", "rules", "skills"];
 const ALLOWED_FILES = new Set(["AGENTS.md", "CHATGPT.md", "COMMANDS-QUICK-REF.md", "RULES.md"]);
@@ -225,6 +229,31 @@ function applySecurityHeaders(req: IncomingMessage, res: ServerResponse) {
   res.setHeader("X-Request-Id", requestId(req));
 }
 
+function clientKey(req: IncomingMessage): string {
+  return req.headers["x-forwarded-for"]?.toString().split(",")[0].trim() || req.socket.remoteAddress || "unknown";
+}
+
+function isRateLimited(req: IncomingMessage): boolean {
+  const now = Date.now();
+  const key = clientKey(req);
+  const current = rateLimits.get(key);
+  if (!current || current.resetAt <= now) {
+    rateLimits.set(key, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return false;
+  }
+  current.count += 1;
+  return current.count > RATE_LIMIT_MAX_REQUESTS;
+}
+
+function hasValidAccessToken(req: IncomingMessage): boolean {
+  if (!ACCESS_TOKEN) return true;
+  const authorization = req.headers.authorization ?? "";
+  const presented = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
+  const expected = Buffer.from(ACCESS_TOKEN);
+  const actual = Buffer.from(presented);
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
 createServer(async (req, res) => {
   const startedAt = Date.now();
   const id = requestId(req);
@@ -234,6 +263,15 @@ createServer(async (req, res) => {
   const isMcpRoute = url.pathname === MCP_PATH || url.pathname.startsWith(`${MCP_PATH}/`);
   logEvent("request.started", { id, method: req.method, path: url.pathname });
   res.on("finish", () => logEvent("request.finished", { id, method: req.method, path: url.pathname, status: res.statusCode, durationMs: Date.now() - startedAt }));
+
+  if (isMcpRoute && req.method !== "OPTIONS" && isRateLimited(req)) {
+    res.writeHead(429, { "content-type": "text/plain; charset=utf-8", "retry-after": "60" }).end("Rate limit exceeded");
+    return;
+  }
+  if (isMcpRoute && req.method !== "OPTIONS" && !hasValidAccessToken(req)) {
+    res.writeHead(401, { "content-type": "text/plain; charset=utf-8", "www-authenticate": "Bearer" }).end("Authentication required");
+    return;
+  }
 
   const contentLength = Number(req.headers["content-length"] ?? 0);
   if (contentLength > MAX_REQUEST_BYTES) {
