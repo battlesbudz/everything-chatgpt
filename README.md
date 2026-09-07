@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/hero.png" alt="ECC - the agent harness operating system" width="100%" />
+  <img src="assets/hero.png" alt="Everything ChatGPT - the agent harness operating system" width="100%" />
 </p>
 
 <p align="center">
@@ -148,9 +148,11 @@ The native path installs ECC's skills, agents, commands, and plugin-managed hook
 
 <p align="center"><a href="#install-ecc">Jump to install ↓</a></p>
 
-# ECC
+# Everything ChatGPT
 
-Your agent can write code, but ECC gives it a coordinated engineering system and toolbox: it plans before it builds, verifies changes with tests, reviews its own work from a fresh context, remembers what matters, and turns repeated wins into reusable skills and workflows.
+> This repository is a community fork of [Everything Claude Code](https://github.com/affaan-m/ECC), adapted for ChatGPT, Codex, and compatible agent harnesses. The upstream project remains the source of truth for its original Claude Code integrations; this fork focuses on making the workflows provider-neutral and ChatGPT-first.
+
+Your agent can write code, but Everything ChatGPT gives it a coordinated engineering system and toolbox: it plans before it builds, verifies changes with tests, reviews its own work from a fresh context, remembers what matters, and turns repeated wins into reusable skills and workflows.
 
 ```text
 plan -> test -> implement -> review -> verify -> remember -> improve
