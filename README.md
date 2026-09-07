@@ -152,6 +152,10 @@ The native path installs ECC's skills, agents, commands, and plugin-managed hook
 
 > This repository is a community fork of [Everything Claude Code](https://github.com/affaan-m/ECC), adapted for ChatGPT, Codex, and compatible agent harnesses. The upstream project remains the source of truth for its original Claude Code integrations; this fork focuses on making the workflows provider-neutral and ChatGPT-first.
 
+## ChatGPT app
+
+ECG includes a private developer-mode ChatGPT app under [`apps/chatgpt`](apps/chatgpt/). It exposes a read-only MCP catalog for searching and reading ECG skills, agents, commands, contexts, rules, and guides, with a small in-ChatGPT widget. Run `npm install` and `npm run app:check` from the repository root to validate it; see [`apps/chatgpt/README.md`](apps/chatgpt/README.md) for local MCP and ChatGPT Developer Mode setup.
+
 Your agent can write code, but Everything ChatGPT gives it a coordinated engineering system and toolbox: it plans before it builds, verifies changes with tests, reviews its own work from a fresh context, remembers what matters, and turns repeated wins into reusable skills and workflows.
 
 ```text
