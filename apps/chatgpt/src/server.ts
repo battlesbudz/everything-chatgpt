@@ -20,6 +20,10 @@ const WIDGET_URI = "ui://widget/ecg-catalog-v1.html";
 const WIDGET_HTML = readFileSync(path.join(APP_ROOT, "public", "widget.html"), "utf8");
 const MAX_RESULTS = 20;
 const MAX_FILE_CHARS = 16_000;
+const MAX_GITHUB_RESULTS = 10;
+const MAX_GITHUB_TREE_ENTRIES = 200;
+const MAX_GITHUB_QUERY_CHARS = 256;
+const MAX_GITHUB_PATH_CHARS = 512;
 const MAX_REQUEST_BYTES = 1_000_000;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX_REQUESTS = 120;
@@ -64,7 +68,7 @@ type ToolResult = {
   _meta?: Record<string, unknown>;
 };
 
-type GitHubIdentity = { id: number; login: string; name?: string | null; email?: string | null };
+type GitHubIdentity = { id: number; login: string; name?: string | null; email?: string | null; githubAccessToken?: string };
 type OAuthState = {
   clientId: string;
   redirectUri: string;
@@ -165,8 +169,55 @@ function appResource() {
   };
 }
 
-function createAppServer(): McpServer {
-  const server = new McpServer({ name: "everything-chatgpt", version: "0.2.0" });
+function githubPathSegment(value: string, label: string): string {
+  const normalized = value.trim();
+  if (!normalized || normalized.length > 128 || !/^[A-Za-z0-9._-]+$/.test(normalized)) {
+    throw new Error(`Invalid GitHub ${label}.`);
+  }
+  return normalized;
+}
+
+function githubRepository(owner: string, repo: string): { owner: string; repo: string } {
+  return { owner: githubPathSegment(owner, "owner"), repo: githubPathSegment(repo.replace(/\.git$/, ""), "repository") };
+}
+
+function githubFilePath(value: string): string {
+  const normalized = value.trim().replaceAll("\\", "/");
+  if (!normalized || normalized.length > MAX_GITHUB_PATH_CHARS || normalized.startsWith("/") || normalized.includes("..")) {
+    throw new Error("Invalid GitHub file path.");
+  }
+  return normalized;
+}
+
+function githubRef(value: string | undefined): string {
+  const ref = (value ?? "").trim();
+  if (ref.length > 256 || ref.includes("..") || /[\r\n]/.test(ref)) throw new Error("Invalid GitHub ref.");
+  return ref;
+}
+
+async function githubApi<T>(apiPath: string, identity?: GitHubIdentity): Promise<T> {
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "x-github-api-version": "2022-11-28",
+    "user-agent": "everything-chatgpt/0.3.0",
+  };
+  if (identity?.githubAccessToken) headers.authorization = `Bearer ${identity.githubAccessToken}`;
+  const response = await fetch(`https://api.github.com${apiPath}`, { headers });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    if (response.status === 401 || response.status === 403) throw new Error("GitHub authorization does not allow this repository or the GitHub rate limit was reached.");
+    if (response.status === 404) throw new Error("GitHub repository or resource was not found, or it is not accessible to this account.");
+    throw new Error(`GitHub API request failed with HTTP ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ""}`);
+  }
+  return await response.json() as T;
+}
+
+function githubIdentityForTools(identity?: GitHubIdentity): GitHubIdentity | undefined {
+  return identity;
+}
+
+function createAppServer(identity?: GitHubIdentity): McpServer {
+  const server = new McpServer({ name: "everything-chatgpt", version: "0.3.0" });
   registerAppResource(server, "ecg-catalog-widget", WIDGET_URI, {}, async () => appResource());
 
   registerAppTool(server, "ecg_overview", {
@@ -232,6 +283,89 @@ function createAppServer(): McpServer {
     };
   });
 
+  registerAppTool(server, "github_search_repositories", {
+    title: "Search GitHub repositories",
+    description: "Use this when the user wants to find GitHub repositories by name, topic, language, or other GitHub search qualifiers. This is read-only.",
+    inputSchema: { query: z.string().min(1).max(MAX_GITHUB_QUERY_CHARS).describe("GitHub repository search query, for example jarvis-os language:kotlin.") },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true },
+    _meta: { ui: { resourceUri: WIDGET_URI }, "openai/toolInvocation/invoking": "Searching GitHub repositories", "openai/toolInvocation/invoked": "GitHub repository search complete" },
+  }, async ({ query }): Promise<ToolResult> => {
+    const trimmed = query.trim();
+    if (!trimmed) throw new Error("GitHub search query cannot be empty.");
+    const payload = await githubApi<{ total_count: number; items: Array<{ full_name: string; name: string; html_url: string; description?: string | null; private: boolean; default_branch: string; stargazers_count: number; language?: string | null }> }>(`/search/repositories?q=${encodeURIComponent(trimmed)}&per_page=${MAX_GITHUB_RESULTS}`, githubIdentityForTools(identity));
+    const results = payload.items.slice(0, MAX_GITHUB_RESULTS).map((item) => ({
+      fullName: item.full_name, name: item.name, url: item.html_url, description: item.description ?? "", private: item.private,
+      defaultBranch: item.default_branch, stars: item.stargazers_count, language: item.language ?? null,
+    }));
+    return {
+      content: [{ type: "text", text: `Found ${results.length} GitHub repository result(s) for “${trimmed}”.` }],
+      structuredContent: { view: "github-repositories", headline: `GitHub repositories: ${trimmed}`, totalCount: payload.total_count, results },
+      _meta: { "openai/outputTemplate": WIDGET_URI },
+    };
+  });
+
+  registerAppTool(server, "github_get_repository", {
+    title: "Inspect a GitHub repository",
+    description: "Use this when the user gives an owner and repository name and wants repository metadata. This is read-only.",
+    inputSchema: {
+      owner: z.string().min(1).max(128).describe("GitHub owner or organization login."),
+      repo: z.string().min(1).max(128).describe("GitHub repository name."),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true },
+    _meta: { ui: { resourceUri: WIDGET_URI }, "openai/toolInvocation/invoking": "Inspecting GitHub repository", "openai/toolInvocation/invoked": "GitHub repository metadata ready" },
+  }, async ({ owner, repo }): Promise<ToolResult> => {
+    const repository = githubRepository(owner, repo);
+    const item = await githubApi<{ full_name: string; html_url: string; description?: string | null; private: boolean; default_branch: string; language?: string | null; stargazers_count: number; forks_count: number; open_issues_count: number; pushed_at?: string | null }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}`, githubIdentityForTools(identity));
+    const result = { fullName: item.full_name, url: item.html_url, description: item.description ?? "", private: item.private, defaultBranch: item.default_branch, language: item.language ?? null, stars: item.stargazers_count, forks: item.forks_count, openIssues: item.open_issues_count, pushedAt: item.pushed_at ?? null };
+    return { content: [{ type: "text", text: `GitHub repository metadata is ready for ${item.full_name}.` }], structuredContent: { view: "github-repository", headline: item.full_name, repository: result }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+  });
+
+  registerAppTool(server, "github_list_tree", {
+    title: "List GitHub repository files",
+    description: "Use this when the user wants to inspect the files and directories in a GitHub repository. This is read-only and returns a bounded listing.",
+    inputSchema: {
+      owner: z.string().min(1).max(128).describe("GitHub owner or organization login."),
+      repo: z.string().min(1).max(128).describe("GitHub repository name."),
+      path: z.string().max(MAX_GITHUB_PATH_CHARS).optional().describe("Optional directory path inside the repository."),
+      ref: z.string().max(256).optional().describe("Optional branch, tag, or commit SHA."),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true },
+    _meta: { ui: { resourceUri: WIDGET_URI }, "openai/toolInvocation/invoking": "Listing GitHub repository files", "openai/toolInvocation/invoked": "GitHub file listing ready" },
+  }, async ({ owner, repo, path: requestedPath, ref }): Promise<ToolResult> => {
+    const repository = githubRepository(owner, repo);
+    const cleanPath = requestedPath ? githubFilePath(requestedPath) : "";
+    const cleanRef = githubRef(ref);
+    const repositoryInfo = await githubApi<{ default_branch: string }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}`, githubIdentityForTools(identity));
+    const effectiveRef = cleanRef || repositoryInfo.default_branch;
+    const payload = await githubApi<{ tree: Array<{ path: string; mode: string; type: string; sha: string; size?: number; url: string }>; truncated?: boolean }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/git/trees/${encodeURIComponent(effectiveRef)}?recursive=1`, githubIdentityForTools(identity));
+    const entries = payload.tree.filter((entry) => !cleanPath || entry.path === cleanPath || entry.path.startsWith(`${cleanPath}/`)).slice(0, MAX_GITHUB_TREE_ENTRIES).map((entry) => ({ path: entry.path, type: entry.type, sha: entry.sha, size: entry.size ?? null, url: entry.url }));
+    return { content: [{ type: "text", text: `Listed ${entries.length} GitHub file entr${entries.length === 1 ? "y" : "ies"} for ${repository.owner}/${repository.repo}.` }], structuredContent: { view: "github-tree", headline: `${repository.owner}/${repository.repo}`, path: cleanPath || "/", ref: effectiveRef, truncated: Boolean(payload.truncated) || payload.tree.length > entries.length, entries }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+  });
+
+  registerAppTool(server, "github_read_file", {
+    title: "Read a GitHub file",
+    description: "Use this when the user wants to inspect the contents of a text file in a GitHub repository. This is read-only, bounded, and never executes the file.",
+    inputSchema: {
+      owner: z.string().min(1).max(128).describe("GitHub owner or organization login."),
+      repo: z.string().min(1).max(128).describe("GitHub repository name."),
+      path: z.string().min(1).max(MAX_GITHUB_PATH_CHARS).describe("File path inside the repository."),
+      ref: z.string().max(256).optional().describe("Optional branch, tag, or commit SHA."),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true },
+    _meta: { ui: { resourceUri: WIDGET_URI }, "openai/toolInvocation/invoking": "Reading GitHub file", "openai/toolInvocation/invoked": "GitHub file contents ready" },
+  }, async ({ owner, repo, path: requestedPath, ref }): Promise<ToolResult> => {
+    const repository = githubRepository(owner, repo);
+    const cleanPath = githubFilePath(requestedPath);
+    const cleanRef = githubRef(ref);
+    const query = cleanRef ? `?ref=${encodeURIComponent(cleanRef)}` : "";
+    const payload = await githubApi<{ type: string; encoding: string; content?: string; size?: number; path: string; sha: string; html_url?: string }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/contents/${cleanPath.split("/").map(encodeURIComponent).join("/")}${query}`, githubIdentityForTools(identity));
+    if (payload.type !== "file" || payload.encoding !== "base64" || typeof payload.content !== "string") throw new Error("The requested GitHub path is not a supported text file.");
+    const decoded = Buffer.from(payload.content.replace(/\s/g, ""), "base64").toString("utf8");
+    const content = decoded.slice(0, MAX_FILE_CHARS);
+    const truncated = decoded.length > content.length;
+    return { content: [{ type: "text", text: `GitHub file ${payload.path}${truncated ? ` (first ${MAX_FILE_CHARS.toLocaleString()} characters)` : ""}\n\n${content}` }], structuredContent: { view: "github-file", headline: `${repository.owner}/${repository.repo}/${payload.path}`, path: payload.path, ref: cleanRef || "default", sha: payload.sha, content, truncated, url: payload.html_url ?? null }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+  });
+
   return server;
 }
 
@@ -291,7 +425,7 @@ async function exchangeGitHubCode(code: string): Promise<GitHubIdentity> {
   const userResponse = await fetch("https://api.github.com/user", { headers });
   if (!userResponse.ok) throw new Error(`GitHub identity lookup failed with ${userResponse.status}`);
   const user = await userResponse.json() as { id: number; login: string; name?: string | null; email?: string | null };
-  return { id: user.id, login: user.login, name: user.name, email: user.email };
+  return { id: user.id, login: user.login, name: user.name, email: user.email, githubAccessToken: tokenPayload.access_token };
 }
 
 function protectedResourceMetadata() {
@@ -363,6 +497,13 @@ function hasValidAccessToken(req: IncomingMessage): boolean {
   const expected = Buffer.from(ACCESS_TOKEN);
   const actual = Buffer.from(presented);
   return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
+function authenticatedIdentity(req: IncomingMessage): GitHubIdentity | undefined {
+  if (!OAUTH_ENABLED) return undefined;
+  const token = oauthAccessTokens.get(bearerToken(req));
+  if (!token || token.expiresAt <= Date.now() || token.resource !== PUBLIC_RESOURCE_URL || !token.scope.split(" ").includes("ecg:read")) return undefined;
+  return token.identity;
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -520,7 +661,7 @@ createServer(async (req, res) => {
     return;
   }
   if (isMcpRoute && req.method && MCP_METHODS.has(req.method)) {
-    const server = createAppServer();
+    const server = createAppServer(authenticatedIdentity(req));
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on("close", () => { transport.close(); server.close(); });
     try { await server.connect(transport); await transport.handleRequest(req, res); }
