@@ -91,7 +91,7 @@ function buildCatalog(): CatalogItem[] {
 function readAllowedFile(relativePath: string): string {
   const normalized = path.posix.normalize(relativePath.replaceAll("\\", "/"));
   const isAllowed = ALLOWED_FILES.has(normalized) || ALLOWED_ROOTS.some((root) => normalized.startsWith(`${root}/`));
-  if (!isAllowed || normalized.startsWith("../") || normalized.includes("/../")) {
+  if (!isAllowed || !normalized.endsWith(".md") || normalized.startsWith("../") || normalized.includes("/../")) {
     throw new Error("Requested path is outside the ECG public catalog.");
   }
 
