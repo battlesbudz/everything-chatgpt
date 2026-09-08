@@ -42,7 +42,7 @@ if (initialized.result?.serverInfo?.name !== "everything-chatgpt") throw new Err
 
 const tools = await call({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
 const toolNames = (tools.result?.tools ?? []).map((tool) => tool.name);
-for (const expected of ["ecg_overview", "search", "fetch", "github_search_repositories", "github_get_repository", "github_list_tree", "github_read_file"]) {
+for (const expected of ["ecg_overview", "search", "fetch", "github_search_repositories", "github_get_repository", "github_list_tree", "github_read_file", "github_list_commits", "github_compare_commits", "github_search_code", "github_propose_patch", "github_create_branch", "github_create_pull_request"]) {
   if (!toolNames.includes(expected)) throw new Error(`missing tool: ${expected}`);
 }
 
