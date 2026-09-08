@@ -338,8 +338,10 @@ function createAppServer(identity?: GitHubIdentity): McpServer {
     const repositoryInfo = await githubApi<{ default_branch: string }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}`, githubIdentityForTools(identity));
     const effectiveRef = cleanRef || repositoryInfo.default_branch;
     const payload = await githubApi<{ tree: Array<{ path: string; mode: string; type: string; sha: string; size?: number; url: string }>; truncated?: boolean }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/git/trees/${encodeURIComponent(effectiveRef)}?recursive=1`, githubIdentityForTools(identity));
-    const entries = payload.tree.filter((entry) => !cleanPath || entry.path === cleanPath || entry.path.startsWith(`${cleanPath}/`)).slice(0, MAX_GITHUB_TREE_ENTRIES).map((entry) => ({ path: entry.path, type: entry.type, sha: entry.sha, size: entry.size ?? null, url: entry.url }));
-    return { content: [{ type: "text", text: `Listed ${entries.length} GitHub file entr${entries.length === 1 ? "y" : "ies"} for ${repository.owner}/${repository.repo}.` }], structuredContent: { view: "github-tree", headline: `${repository.owner}/${repository.repo}`, path: cleanPath || "/", ref: effectiveRef, truncated: Boolean(payload.truncated) || payload.tree.length > entries.length, entries }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+    const matchingEntries = payload.tree.filter((entry) => !cleanPath || entry.path === cleanPath || entry.path.startsWith(`${cleanPath}/`));
+    const entries = matchingEntries.slice(0, MAX_GITHUB_TREE_ENTRIES).map((entry) => ({ path: entry.path, type: entry.type, sha: entry.sha, size: entry.size ?? null, url: entry.url }));
+    const truncated = Boolean(payload.truncated) || matchingEntries.length > MAX_GITHUB_TREE_ENTRIES;
+    return { content: [{ type: "text", text: `Listed ${entries.length} GitHub file entr${entries.length === 1 ? "y" : "ies"} for ${repository.owner}/${repository.repo}.` }], structuredContent: { view: "github-tree", headline: `${repository.owner}/${repository.repo}`, path: cleanPath || "/", ref: effectiveRef, truncated, entries }, _meta: { "openai/outputTemplate": WIDGET_URI } };
   });
 
   registerAppTool(server, "github_read_file", {
