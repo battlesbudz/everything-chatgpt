@@ -15,10 +15,16 @@ This is an interactive-decoupled app: the MCP server owns the catalog and the wi
 - `github_get_repository` — inspect repository metadata.
 - `github_list_tree` — list a bounded repository tree for a branch, tag, or commit.
 - `github_read_file` — read a bounded text file without executing it.
+- `github_list_commits` — read recent commit history, optionally filtered by path.
+- `github_compare_commits` — read a bounded diff between two refs.
+- `github_search_code` — search content inside a repository; GitHub may require authenticated code-search access.
+- `github_propose_patch` — validate expected file SHAs and produce a reviewable patch preview without writing.
+- `github_create_branch` — after explicit approval, create a non-default branch and apply the approved patch.
+- `github_create_pull_request` — after explicit approval, open a PR without merging it.
 
 The server only exposes a bounded set of ECG documentation paths. It rejects traversal attempts and truncates returned files to keep tool responses manageable.
 
-The service applies request-size and per-client rate limits, structured request logs, security headers, and an allowlist-based CORS policy. `ECG_ACCESS_TOKEN` remains available as a local/private fallback. For ChatGPT, use the OAuth 2.1 mode described below; it provides MCP protected-resource metadata, PKCE, GitHub identity, short-lived access tokens, and the `ecg:read` scope. GitHub OAuth tokens are used only for the read-only GitHub tools in this phase; no write scopes are requested.
+The service applies request-size and per-client rate limits, structured request logs, security headers, and an allowlist-based CORS policy. `ECG_ACCESS_TOKEN` remains available as a local/private fallback. For ChatGPT, use the OAuth 2.1 mode described below; it provides MCP protected-resource metadata, PKCE, GitHub identity, short-lived access tokens, and `ecg:read`/`ecg:write` scopes. The GitHub OAuth flow requests `read:user user:email public_repo`: public-repository branch and PR writes are supported after explicit approval; private-repository access should move to a fine-grained GitHub App before production use.
 
 ## OAuth configuration
 
