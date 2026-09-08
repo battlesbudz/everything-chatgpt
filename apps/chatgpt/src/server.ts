@@ -216,7 +216,7 @@ async function githubApi<T>(apiPath: string, identity?: GitHubIdentity, options:
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
     "x-github-api-version": "2022-11-28",
-    "user-agent": "everything-chatgpt/0.4.0",
+    "user-agent": "everything-chatgpt/0.4.1",
   };
   if (identity?.githubAccessToken) headers.authorization = `Bearer ${identity.githubAccessToken}`;
   if (options.body !== undefined) headers["content-type"] = "application/json";
@@ -351,7 +351,7 @@ async function fallbackGitHubCodeSearch(repository: { owner: string; repo: strin
 }
 
 function createAppServer(identity?: GitHubIdentity): McpServer {
-  const server = new McpServer({ name: "everything-chatgpt", version: "0.4.0" }, {
+  const server = new McpServer({ name: "everything-chatgpt", version: "0.4.1" }, {
     instructions: "GitHub read tools are safe to use for inspection. Before creating a branch or pull request, obtain explicit user approval for the exact repository, branch, and proposed changes.",
   });
   registerAppResource(server, "ecg-catalog-widget", WIDGET_URI, {}, async () => appResource());
