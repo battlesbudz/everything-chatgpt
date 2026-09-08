@@ -29,6 +29,8 @@ const MAX_GITHUB_DIFF_CHARS = 32_000;
 const MAX_GITHUB_PATCH_CHARS = 16_000;
 const MAX_GITHUB_PATCH_FILES = 10;
 const MAX_GITHUB_PATCH_TOTAL_CHARS = 64_000;
+const MAX_GITHUB_FALLBACK_FILES = 32;
+const MAX_GITHUB_FALLBACK_CHARS = 128_000;
 const MAX_REQUEST_BYTES = 1_000_000;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX_REQUESTS = 120;
@@ -281,6 +283,73 @@ async function readGitHubTextFile(owner: string, repo: string, pathname: string,
   }
 }
 
+function githubCodeSearchTerms(query: string): string[] {
+  return query
+    .replace(/repo:[^\s]+/gi, " ")
+    .replace(/\b(?:path|language|extension|filename):[^\s]+/gi, " ")
+    .replace(/["']/g, " ")
+    .split(/\s+/)
+    .map((term) => term.trim().toLowerCase())
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
+function isLikelyTextPath(pathname: string): boolean {
+  const lower = pathname.toLowerCase();
+  return !/\.(7z|avi|bmp|class|dll|doc|docx|exe|gif|ico|jar|jpeg|jpg|mov|mp3|mp4|pdf|png|so|tar|ttf|wav|webm|woff2?|zip)$/i.test(lower);
+}
+
+function fallbackPathPriority(pathname: string): number {
+  const lower = pathname.toLowerCase();
+  let score = 0;
+  if (lower.startsWith("src/") || lower.includes("/src/")) score += 40;
+  if (lower.startsWith("app/") || lower.includes("/app/") || lower.startsWith("apps/")) score += 30;
+  if (lower.startsWith("lib/") || lower.includes("/lib/")) score += 20;
+  if (lower.startsWith("scripts/") || lower.includes("/scripts/")) score += 15;
+  if (lower.startsWith("tests/") || lower.includes("/tests/")) score += 10;
+  if (/\.(ts|tsx|js|jsx|py|go|rs|java|kt|swift|rb|php|c|cc|cpp|h|hpp|cs|json|yaml|yml|md)$/i.test(lower)) score += 5;
+  return score;
+}
+
+async function fallbackGitHubCodeSearch(repository: { owner: string; repo: string }, query: string, ref: string, identity?: GitHubIdentity) {
+  const terms = githubCodeSearchTerms(query);
+  if (terms.length === 0) return { results: [], scannedFiles: 0, scannedChars: 0 };
+  const tree = await githubApi<{ tree: Array<{ path: string; type: string; sha: string; url: string }>; truncated?: boolean }>(
+    `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/git/trees/${encodeURIComponent(ref)}?recursive=1`,
+    identity,
+  );
+  const candidates = tree.tree
+    .filter((entry) => entry.type === "blob" && isLikelyTextPath(entry.path))
+    .sort((left, right) => fallbackPathPriority(right.path) - fallbackPathPriority(left.path) || left.path.length - right.path.length || left.path.localeCompare(right.path))
+    .slice(0, MAX_GITHUB_FALLBACK_FILES);
+  const results: Array<{ name: string; path: string; sha: string; url: string; repository: string; snippet: string }> = [];
+  let scannedChars = 0;
+  let scannedFiles = 0;
+  const stopAfterFirst = terms.length === 1 && /^[a-z_$][\w$.-]*$/i.test(terms[0]);
+  for (const candidate of candidates) {
+    if (scannedChars >= MAX_GITHUB_FALLBACK_CHARS || results.length >= MAX_GITHUB_RESULTS) break;
+    if (stopAfterFirst && results.length > 0) break;
+    scannedFiles += 1;
+    const file = await readGitHubTextFile(repository.owner, repository.repo, candidate.path, ref, identity);
+    if (!file) continue;
+    const content = file.content.slice(0, Math.max(0, MAX_GITHUB_FALLBACK_CHARS - scannedChars));
+    scannedChars += content.length;
+    const lowerContent = content.toLowerCase();
+    if (!terms.every((term) => lowerContent.includes(term))) continue;
+    const firstTermIndex = lowerContent.indexOf(terms[0]);
+    const start = Math.max(0, firstTermIndex - 120);
+    results.push({
+      name: candidate.path.split("/").pop() ?? candidate.path,
+      path: candidate.path,
+      sha: file.sha,
+      url: `https://github.com/${repository.owner}/${repository.repo}/blob/${encodeURIComponent(ref)}/${candidate.path.split("/").map(encodeURIComponent).join("/")}`,
+      repository: `${repository.owner}/${repository.repo}`,
+      snippet: content.slice(start, start + 360).replace(/\s+/g, " ").trim(),
+    });
+  }
+  return { results, scannedFiles, scannedChars };
+}
+
 function createAppServer(identity?: GitHubIdentity): McpServer {
   const server = new McpServer({ name: "everything-chatgpt", version: "0.4.0" }, {
     instructions: "GitHub read tools are safe to use for inspection. Before creating a branch or pull request, obtain explicit user approval for the exact repository, branch, and proposed changes.",
@@ -498,9 +567,29 @@ function createAppServer(identity?: GitHubIdentity): McpServer {
   }, async ({ owner, repo, query }): Promise<ToolResult> => {
     const repository = githubRepository(owner, repo);
     const trimmed = query.trim();
-    const payload = await githubApi<{ total_count: number; incomplete_results: boolean; items: Array<{ name: string; path: string; sha: string; html_url: string; repository?: { full_name: string } }> }>(`/search/code?q=${encodeURIComponent(`${trimmed} repo:${repository.owner}/${repository.repo}`)}&per_page=${MAX_GITHUB_RESULTS}`, githubIdentityForTools(identity));
-    const results = payload.items.slice(0, MAX_GITHUB_RESULTS).map((item) => ({ name: item.name, path: item.path, sha: item.sha, url: item.html_url, repository: item.repository?.full_name ?? `${repository.owner}/${repository.repo}` }));
-    return { content: [{ type: "text", text: `Found ${results.length} GitHub code result(s) for “${trimmed}”.` }], structuredContent: { view: "github-code-search", headline: `${repository.owner}/${repository.repo}: ${trimmed}`, totalCount: payload.total_count, incomplete: payload.incomplete_results, results }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+    let payload: { total_count: number; incomplete_results: boolean; items: Array<{ name: string; path: string; sha: string; html_url: string; repository?: { full_name: string } }> };
+    let apiFallbackReason: string | null = null;
+    try {
+      payload = await githubApi<{ total_count: number; incomplete_results: boolean; items: Array<{ name: string; path: string; sha: string; html_url: string; repository?: { full_name: string } }> }>(`/search/code?q=${encodeURIComponent(`${trimmed} repo:${repository.owner}/${repository.repo}`)}&per_page=${MAX_GITHUB_RESULTS}`, githubIdentityForTools(identity));
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.startsWith("GitHub authorization")) throw error;
+      payload = { total_count: 0, incomplete_results: true, items: [] };
+      apiFallbackReason = error.message;
+    }
+    let results = payload.items.slice(0, MAX_GITHUB_RESULTS).map((item) => ({ name: item.name, path: item.path, sha: item.sha, url: item.html_url, repository: item.repository?.full_name ?? `${repository.owner}/${repository.repo}`, snippet: null as string | null }));
+    let fallbackUsed = false;
+    let fallbackScannedFiles = 0;
+    let fallbackScannedChars = 0;
+    if (payload.incomplete_results && results.length === 0) {
+      const repositoryInfo = await githubApi<{ default_branch: string }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}`, githubIdentityForTools(identity));
+      const fallback = await fallbackGitHubCodeSearch(repository, trimmed, repositoryInfo.default_branch, githubIdentityForTools(identity));
+      results = fallback.results;
+      fallbackUsed = true;
+      fallbackScannedFiles = fallback.scannedFiles;
+      fallbackScannedChars = fallback.scannedChars;
+    }
+    const status = fallbackUsed ? `${apiFallbackReason ? "GitHub code search was unavailable, so" : "GitHub returned an incomplete zero-result response, so"} ECG scanned ${fallbackScannedFiles} bounded text file(s) locally and found ${results.length} match(es).` : `Found ${results.length} GitHub code result(s) for “${trimmed}”.`;
+    return { content: [{ type: "text", text: status }], structuredContent: { view: "github-code-search", headline: `${repository.owner}/${repository.repo}: ${trimmed}`, totalCount: payload.total_count, incomplete: payload.incomplete_results, fallbackUsed, fallbackScannedFiles, fallbackScannedChars, results }, _meta: { "openai/outputTemplate": WIDGET_URI } };
   });
 
   registerAppTool(server, "github_propose_patch", {
