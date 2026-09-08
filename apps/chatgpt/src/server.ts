@@ -92,7 +92,7 @@ function authorized(req: IncomingMessage): boolean { return !ACCESS_TOKEN || req
 
 const port = Number(process.env.PORT ?? "8787");
 createServer(async (req, res) => {
-  const startedAt = Date.now(); const id = requestId(req); const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`); const isMcp = url.pathname === "/mcp";
+  const startedAt = Date.now(); const id = requestId(req); const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`); const isMcp = url.pathname === "/mcp" || url.pathname === "/mcp/";
   res.setHeader("X-Content-Type-Options", "nosniff"); res.setHeader("Referrer-Policy", "no-referrer"); res.setHeader("X-Request-Id", id); const origin = allowedOrigin(req); if (origin) { res.setHeader("Access-Control-Allow-Origin", origin); res.setHeader("Vary", "Origin"); }
   logEvent("request.started", { id, method: req.method, path: url.pathname }); res.on("finish", () => logEvent("request.finished", { id, status: res.statusCode, durationMs: Date.now() - startedAt }));
   if (isMcp && req.method === "OPTIONS") { res.writeHead(204, { "Access-Control-Allow-Methods": "POST, GET, DELETE, OPTIONS", "Access-Control-Allow-Headers": "content-type, mcp-session-id, authorization, x-request-id" }).end(); return; }
