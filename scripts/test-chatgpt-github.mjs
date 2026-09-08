@@ -43,8 +43,8 @@ if (!Array.isArray(commits.structuredContent?.results) || commits.structuredCont
 const comparison = await call("tools/call", { name: "github_compare_commits", arguments: { owner, repo, base: "main", head: "main" } });
 if (comparison.structuredContent?.status !== "identical") throw new Error("same-ref comparison was not identical");
 
-const codeSearch = await call("tools/call", { name: "github_search_code", arguments: { owner, repo, query: "github_read_file" } });
-if (!Array.isArray(codeSearch.structuredContent?.results) && !codeSearch.isError) throw new Error("code search returned neither results nor a clear authorization error");
+const codeSearch = await call("tools/call", { name: "github_search_code", arguments: { owner, repo, query: "github_create_pull_request" } });
+if (!codeSearch.isError && (!Array.isArray(codeSearch.structuredContent?.results) || (codeSearch.structuredContent.results.length === 0 && !codeSearch.structuredContent?.fallbackUsed))) throw new Error("code search returned neither results nor a bounded fallback result");
 
 const proposal = await call("tools/call", {
   name: "github_propose_patch",
@@ -58,4 +58,4 @@ const writeAttempt = await call("tools/call", {
 });
 if (!writeAttempt.isError) throw new Error("unauthenticated local server unexpectedly allowed branch creation");
 
-console.log(JSON.stringify({ ok: true, repository: repository.structuredContent.repository.fullName, treeEntries: tree.structuredContent.entries.length, fileChars: file.structuredContent.content.length, searchResults: search.structuredContent.results.length, commits: commits.structuredContent.results.length, codeResults: codeSearch.structuredContent?.results?.length ?? 0, codeSearchRequiresAuth: Boolean(codeSearch.isError), proposalId: proposal.structuredContent.proposalId, writeBlocked: true }));
+console.log(JSON.stringify({ ok: true, repository: repository.structuredContent.repository.fullName, treeEntries: tree.structuredContent.entries.length, fileChars: file.structuredContent.content.length, searchResults: search.structuredContent.results.length, commits: commits.structuredContent.results.length, codeResults: codeSearch.structuredContent?.results?.length ?? 0, codeSearchFallbackUsed: Boolean(codeSearch.structuredContent?.fallbackUsed), codeSearchRequiresAuth: Boolean(codeSearch.isError), proposalId: proposal.structuredContent.proposalId, writeBlocked: true }));
