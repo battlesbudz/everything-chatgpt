@@ -625,7 +625,7 @@ function createAppServer(identity?: GitHubIdentity): McpServer {
 
   registerAppTool(server, "github_create_branch", {
     title: "Create a GitHub branch from a patch",
-    description: "Use this only after the user explicitly approves the exact patch proposal. It creates a new non-default branch and applies the approved bounded changes; it never writes directly to the default branch.",
+    description: "Use this only after the user explicitly approves the exact patch proposal. It creates a new non-default branch and applies all approved changes as one atomic commit; it never writes directly to the default branch.",
     inputSchema: {
       owner: z.string().min(1).max(128).describe("GitHub owner or organization login."),
       repo: z.string().min(1).max(128).describe("GitHub repository name."),
@@ -647,24 +647,31 @@ function createAppServer(identity?: GitHubIdentity): McpServer {
     const repositoryInfo = await githubApi<{ default_branch: string }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}`, writeIdentity);
     if (cleanBranch === repositoryInfo.default_branch) throw new Error("ECG will not write a patch directly to the repository default branch.");
     const base = await githubApi<{ object: { sha: string } }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/git/ref/heads/${encodeURIComponent(cleanBase)}`, writeIdentity);
-    await githubApi(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/git/refs`, writeIdentity, { method: "POST", body: { ref: `refs/heads/${cleanBranch}`, sha: base.object.sha } });
-    const applied: string[] = [];
-    try {
-      for (const change of normalizedChanges) {
-        const contentPath = change.path.split("/").map(encodeURIComponent).join("/");
-        const endpoint = `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/contents/${contentPath}`;
-        if (change.operation === "delete") {
-          await githubApi(endpoint, writeIdentity, { method: "DELETE", body: { message: `ECG: delete ${change.path}`, branch: cleanBranch, sha: change.expectedSha } });
-        } else {
-          await githubApi(endpoint, writeIdentity, { method: "PUT", body: { message: `ECG: ${change.operation} ${change.path}`, branch: cleanBranch, content: Buffer.from(change.content ?? "", "utf8").toString("base64"), ...(change.expectedSha ? { sha: change.expectedSha } : {}) } });
-        }
-        applied.push(change.path);
-      }
-    } catch (error) {
-      logEvent("github.branch_partial", { owner: repository.owner, repo: repository.repo, branch: cleanBranch, proposalId, applied, error: error instanceof Error ? error.message : String(error) });
-      throw new Error(`Branch ${cleanBranch} was created, but applying the approved patch stopped after ${applied.length} file(s). Inspect the branch before retrying.`);
+    const baseSha = base.object.sha;
+    const conflicts: string[] = [];
+    for (const change of normalizedChanges) {
+      const current = await readGitHubTextFile(repository.owner, repository.repo, change.path, cleanBase, writeIdentity);
+      if (change.operation === "create" && current) conflicts.push(`${change.path} already exists`);
+      if (change.operation !== "create" && !current) conflicts.push(`${change.path} no longer exists`);
+      if (change.operation !== "create" && current && current.sha !== change.expectedSha) conflicts.push(`${change.path} changed since the proposal (expected ${change.expectedSha}, found ${current.sha})`);
     }
-    return { content: [{ type: "text", text: `Created branch ${cleanBranch} from ${cleanBase} and applied ${applied.length} approved file change(s).` }], structuredContent: { view: "github-branch", headline: `${repository.owner}/${repository.repo}:${cleanBranch}`, owner: repository.owner, repo: repository.repo, branchName: cleanBranch, baseRef: cleanBase, proposalId, applied }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+    if (conflicts.length > 0) throw new Error(`Patch proposal is stale and was not applied: ${conflicts.join("; ")}`);
+
+    const baseCommit = await githubApi<{ tree: { sha: string } }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/git/commits/${encodeURIComponent(baseSha)}`, writeIdentity);
+    const treeEntries: Array<{ path: string; mode: "100644"; type: "blob"; sha: string | null }> = [];
+    for (const change of normalizedChanges) {
+      if (change.operation === "delete") {
+        treeEntries.push({ path: change.path, mode: "100644", type: "blob", sha: null });
+        continue;
+      }
+      const blob = await githubApi<{ sha: string }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/git/blobs`, writeIdentity, { method: "POST", body: { content: Buffer.from(change.content ?? "", "utf8").toString("base64"), encoding: "base64" } });
+      treeEntries.push({ path: change.path, mode: "100644", type: "blob", sha: blob.sha });
+    }
+    const tree = await githubApi<{ sha: string }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/git/trees`, writeIdentity, { method: "POST", body: { base_tree: baseCommit.tree.sha, tree: treeEntries } });
+    const commit = await githubApi<{ sha: string; html_url?: string }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/git/commits`, writeIdentity, { method: "POST", body: { message: `ECG: apply approved patch ${proposalId.slice(0, 12)}`, tree: tree.sha, parents: [baseSha] } });
+    await githubApi(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/git/refs`, writeIdentity, { method: "POST", body: { ref: `refs/heads/${cleanBranch}`, sha: commit.sha } });
+    const applied = normalizedChanges.map((change) => change.path);
+    return { content: [{ type: "text", text: `Created branch ${cleanBranch} from ${cleanBase} and applied ${applied.length} approved file change(s) in one atomic commit.` }], structuredContent: { view: "github-branch", headline: `${repository.owner}/${repository.repo}:${cleanBranch}`, owner: repository.owner, repo: repository.repo, branchName: cleanBranch, baseRef: cleanBase, proposalId, commitSha: commit.sha, commitUrl: commit.html_url ?? null, atomic: true, applied }, _meta: { "openai/outputTemplate": WIDGET_URI } };
   });
 
   registerAppTool(server, "github_create_pull_request", {
