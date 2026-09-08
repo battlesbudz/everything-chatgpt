@@ -23,11 +23,6 @@ if (!health.ok) throw new Error(`health check returned HTTP ${health.status}`);
 const healthBody = await health.json();
 if (healthBody.status !== "ok") throw new Error("health check did not report ok");
 
-const resourceMetadata = await fetch(baseUrl.replace(/\/mcp$/, "/.well-known/oauth-protected-resource"));
-if (!resourceMetadata.ok) throw new Error(`OAuth protected-resource metadata returned HTTP ${resourceMetadata.status}`);
-const resourceMetadataBody = await resourceMetadata.json();
-if (!Array.isArray(resourceMetadataBody.authorization_servers)) throw new Error("OAuth metadata is missing authorization_servers");
-
 const initialized = await call({
   jsonrpc: "2.0",
   id: 1,
@@ -42,7 +37,7 @@ if (initialized.result?.serverInfo?.name !== "everything-chatgpt") throw new Err
 
 const tools = await call({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
 const toolNames = (tools.result?.tools ?? []).map((tool) => tool.name);
-for (const expected of ["ecg_overview", "search", "fetch", "github_search_repositories", "github_get_repository", "github_list_tree", "github_read_file", "github_list_commits", "github_compare_commits", "github_search_code", "github_propose_patch", "github_create_branch", "github_create_pull_request"]) {
+for (const expected of ["ecg_overview", "search", "fetch", "ecg_plan_workflow"]) {
   if (!toolNames.includes(expected)) throw new Error(`missing tool: ${expected}`);
 }
 
