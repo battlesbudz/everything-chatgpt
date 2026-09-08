@@ -12,6 +12,9 @@ import {
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { EncryptedJsonStore } from "./encrypted-store.js";
+import { runSandboxedTest } from "./sandbox.js";
+import { planWorkflow } from "./workflow.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const APP_ROOT = path.resolve(__dirname, "..");
@@ -47,10 +50,10 @@ const OAUTH_SCOPES = ["ecg:read"] as const;
 const OAUTH_CODE_TTL_MS = 5 * 60_000;
 const OAUTH_TOKEN_TTL_MS = 60 * 60_000;
 const OAUTH_REFRESH_TTL_MS = 30 * 24 * 60 * 60_000;
-const oauthStates = new Map<string, OAuthState>();
-const oauthCodes = new Map<string, OAuthCode>();
-const oauthAccessTokens = new Map<string, OAuthToken>();
-const oauthRefreshTokens = new Map<string, OAuthRefreshToken>();
+const oauthStates = new EncryptedJsonStore<OAuthState>("oauth-states");
+const oauthCodes = new EncryptedJsonStore<OAuthCode>("oauth-codes");
+const oauthAccessTokens = new EncryptedJsonStore<OAuthToken>("oauth-access-tokens");
+const oauthRefreshTokens = new EncryptedJsonStore<OAuthRefreshToken>("oauth-refresh-tokens");
 const ALLOWED_ORIGINS = new Set(
   (process.env.ECG_ALLOWED_ORIGINS ?? "https://chatgpt.com,https://www.chatgpt.com,https://chat.openai.com,http://localhost:3000,http://localhost:8787")
     .split(",")
@@ -210,13 +213,13 @@ function githubBranchName(value: string): string {
   return branch;
 }
 
-type GitHubRequestOptions = { method?: "GET" | "POST" | "PUT" | "DELETE"; body?: unknown };
+type GitHubRequestOptions = { method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; body?: unknown };
 
 async function githubApi<T>(apiPath: string, identity?: GitHubIdentity, options: GitHubRequestOptions = {}): Promise<T> {
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
     "x-github-api-version": "2022-11-28",
-    "user-agent": "everything-chatgpt/0.4.2",
+    "user-agent": "everything-chatgpt/0.5.0",
   };
   if (identity?.githubAccessToken) headers.authorization = `Bearer ${identity.githubAccessToken}`;
   if (options.body !== undefined) headers["content-type"] = "application/json";
@@ -230,6 +233,18 @@ async function githubApi<T>(apiPath: string, identity?: GitHubIdentity, options:
   return await response.json() as T;
 }
 
+async function githubGraphql<T>(query: string, variables: Record<string, unknown>, identity: GitHubIdentity): Promise<T> {
+  const response = await fetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers: { accept: "application/vnd.github+json", "content-type": "application/json", authorization: `Bearer ${identity.githubAccessToken}`, "x-github-api-version": "2022-11-28", "user-agent": "everything-chatgpt/0.5.0" },
+    body: JSON.stringify({ query, variables }),
+  });
+  const payload = await response.json() as { data?: T; errors?: Array<{ message?: string }> };
+  if (!response.ok || payload.errors?.length) throw new Error(payload.errors?.map((error) => error.message).filter(Boolean).join("; ") || `GitHub GraphQL request failed with HTTP ${response.status}`);
+  if (!payload.data) throw new Error("GitHub GraphQL returned no data.");
+  return payload.data;
+}
+
 function githubIdentityForTools(identity?: GitHubIdentity): GitHubIdentity | undefined {
   return identity;
 }
@@ -238,7 +253,16 @@ function requireGitHubWriteIdentity(identity?: GitHubIdentity): GitHubIdentity {
   if (!identity?.githubAccessToken) {
     throw new Error("GitHub write access is not authorized. Reconnect ECG TOOL and approve GitHub repository access before creating branches or pull requests.");
   }
+  if (process.env.ECG_ENABLE_WRITES === "false") throw new Error("GitHub write operations are disabled by server policy.");
   return identity;
+}
+
+function assertRepositoryPolicy(repository: { owner: string; repo: string }, operation: "read" | "write"): void {
+  const configured = (process.env.ECG_ALLOWED_REPOSITORIES ?? "").split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
+  if (configured.length > 0 && !configured.includes(`${repository.owner}/${repository.repo}`.toLowerCase())) {
+    throw new Error(`This repository is outside ECG_ALLOWED_REPOSITORIES for ${operation} operations.`);
+  }
+  if (operation === "write" && process.env.ECG_ENABLE_WRITES === "false") throw new Error("GitHub write operations are disabled by server policy.");
 }
 
 type PatchOperation = "create" | "update" | "delete";
@@ -351,8 +375,8 @@ async function fallbackGitHubCodeSearch(repository: { owner: string; repo: strin
 }
 
 function createAppServer(identity?: GitHubIdentity): McpServer {
-  const server = new McpServer({ name: "everything-chatgpt", version: "0.4.2" }, {
-    instructions: "GitHub read tools are safe to use for inspection. Before creating a branch or pull request, obtain explicit user approval for the exact repository, branch, and proposed changes.",
+  const server = new McpServer({ name: "everything-chatgpt", version: "0.5.0" }, {
+    instructions: "Use read tools to inspect repositories and PRs. Before any GitHub write or sandbox execution, obtain explicit approval for the exact target, content, and action. Never merge automatically. Read the most relevant ECG skills before implementation.",
   });
   registerAppResource(server, "ecg-catalog-widget", WIDGET_URI, {}, async () => appResource());
 
@@ -592,6 +616,102 @@ function createAppServer(identity?: GitHubIdentity): McpServer {
     return { content: [{ type: "text", text: status }], structuredContent: { view: "github-code-search", headline: `${repository.owner}/${repository.repo}: ${trimmed}`, totalCount: payload.total_count, incomplete: payload.incomplete_results, fallbackUsed, fallbackScannedFiles, fallbackScannedChars, results }, _meta: { "openai/outputTemplate": WIDGET_URI } };
   });
 
+  registerAppTool(server, "github_get_pull_request", {
+    title: "Inspect a GitHub pull request",
+    description: "Use this when the user wants the status, branches, checks, mergeability, or files of an existing pull request. This is read-only.",
+    inputSchema: { owner: z.string().min(1).max(128), repo: z.string().min(1).max(128), number: z.number().int().min(1).max(100000) },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true },
+    _meta: { ui: { resourceUri: WIDGET_URI } },
+  }, async ({ owner, repo, number }): Promise<ToolResult> => {
+    const repository = githubRepository(owner, repo);
+    const pull = await githubApi<{ number: number; title: string; body: string | null; state: string; draft: boolean; html_url: string; mergeable: boolean | null; mergeable_state: string; head: { ref: string; sha: string }; base: { ref: string; sha: string }; changed_files: number; additions: number; deletions: number; commits: number; requested_reviewers?: Array<{ login: string }> }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/pulls/${number}`, githubIdentityForTools(identity));
+    return { content: [{ type: "text", text: `GitHub PR #${pull.number}: ${pull.title}. Mergeability is ${pull.mergeable_state}.` }], structuredContent: { view: "github-pull-request-detail", ...pull, requestedReviewers: (pull.requested_reviewers ?? []).map((reviewer) => reviewer.login) }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+  });
+
+  registerAppTool(server, "github_list_pull_request_reviews", {
+    title: "Read GitHub pull-request review activity",
+    description: "Use this when the user wants reviews, review comments, conversation comments, or unresolved review threads for a pull request. This is read-only.",
+    inputSchema: { owner: z.string().min(1).max(128), repo: z.string().min(1).max(128), number: z.number().int().min(1).max(100000) },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true },
+    _meta: { ui: { resourceUri: WIDGET_URI } },
+  }, async ({ owner, repo, number }): Promise<ToolResult> => {
+    const repository = githubRepository(owner, repo);
+    const [reviews, reviewComments, issueComments] = await Promise.all([
+      githubApi<Array<{ id: number; node_id?: string; user?: { login: string }; body: string | null; state: string; submitted_at: string | null; html_url: string }>>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/pulls/${number}/reviews`, githubIdentityForTools(identity)),
+      githubApi<Array<{ id: number; node_id?: string; user?: { login: string }; body: string; path: string; line: number | null; side?: string; in_reply_to_id?: number; created_at: string; html_url: string }>>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/pulls/${number}/comments`, githubIdentityForTools(identity)),
+      githubApi<Array<{ id: number; user?: { login: string }; body: string; created_at: string; html_url: string }>>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/issues/${number}/comments`, githubIdentityForTools(identity)),
+    ]);
+    let threads: Array<{ id: string; isResolved: boolean; path?: string; line?: number | null }> = [];
+    try {
+      const data = await githubGraphql<{ repository: { pullRequest: { reviewThreads: { nodes: Array<{ id: string; isResolved: boolean; path: string; line: number | null }> } } } }>(`query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100){nodes{id isResolved path line}}}}}`, { owner: repository.owner, repo: repository.repo, number }, requireGitHubWriteIdentity(identity));
+      threads = data.repository.pullRequest.reviewThreads.nodes;
+    } catch { /* Fine-grained tokens may not have GraphQL thread access; REST reviews remain useful. */ }
+    return { content: [{ type: "text", text: `Found ${reviews.length} review(s), ${reviewComments.length} inline comment(s), and ${issueComments.length} conversation comment(s) on PR #${number}.` }], structuredContent: { view: "github-pull-request-reviews", reviews, reviewComments, issueComments, threads, unresolvedThreads: threads.filter((thread) => !thread.isResolved) }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+  });
+
+  registerAppTool(server, "github_update_pull_request", {
+    title: "Update a GitHub pull request",
+    description: "Use this only after explicit approval of the exact PR number and fields. Updates title, body, target branch, or open/closed state; it never merges a PR.",
+    inputSchema: { owner: z.string().min(1).max(128), repo: z.string().min(1).max(128), number: z.number().int().min(1).max(100000), title: z.string().min(1).max(256).optional(), body: z.string().max(16000).optional(), base: z.string().max(256).optional(), state: z.enum(["open", "closed"]).optional() },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
+    _meta: { ui: { resourceUri: WIDGET_URI } },
+  }, async ({ owner, repo, number, title, body, base, state }): Promise<ToolResult> => {
+    const writeIdentity = requireGitHubWriteIdentity(identity);
+    const repository = githubRepository(owner, repo); assertRepositoryPolicy(repository, "write");
+    const pull = await githubApi<{ number: number; title: string; body: string | null; state: string; html_url: string; head: { ref: string }; base: { ref: string } }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/pulls/${number}`, writeIdentity, { method: "PATCH", body: { ...(title === undefined ? {} : { title: title.trim() }), ...(body === undefined ? {} : { body: body.trim() }), ...(base === undefined ? {} : { base: githubBranchName(base) }), ...(state === undefined ? {} : { state }) } });
+    return { content: [{ type: "text", text: `Updated GitHub PR #${pull.number}: ${pull.title}. It was not merged.` }], structuredContent: { view: "github-pull-request", number: pull.number, title: pull.title, body: pull.body, state: pull.state, url: pull.html_url, head: pull.head.ref, base: pull.base.ref }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+  });
+
+  registerAppTool(server, "github_create_pull_request_review", {
+    title: "Submit a GitHub pull-request review",
+    description: "Use this only after explicit approval of the repository, PR number, review event, and exact review text. Can submit a comment, approval, or change request without merging.",
+    inputSchema: { owner: z.string().min(1).max(128), repo: z.string().min(1).max(128), number: z.number().int().min(1).max(100000), commitId: z.string().min(7).max(64), body: z.string().max(16000), event: z.enum(["COMMENT", "APPROVE", "REQUEST_CHANGES"]), comments: z.array(z.object({ path: z.string().min(1).max(MAX_GITHUB_PATH_CHARS), line: z.number().int().min(1).max(100000), side: z.enum(["LEFT", "RIGHT"]).default("RIGHT"), body: z.string().min(1).max(4000) })).max(20).optional() },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
+    _meta: { ui: { resourceUri: WIDGET_URI } },
+  }, async ({ owner, repo, number, commitId, body, event, comments }): Promise<ToolResult> => {
+    const writeIdentity = requireGitHubWriteIdentity(identity);
+    const repository = githubRepository(owner, repo); assertRepositoryPolicy(repository, "write");
+    const review = await githubApi<{ id: number; html_url: string; state: string }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/pulls/${number}/reviews`, writeIdentity, { method: "POST", body: { commit_id: commitId, body: body.trim(), event, comments: comments?.map((comment) => ({ path: comment.path, line: comment.line, side: comment.side, body: comment.body })) ?? [] } });
+    return { content: [{ type: "text", text: `Submitted ${event.toLowerCase()} review ${review.id} on PR #${number}.` }], structuredContent: { view: "github-review", id: review.id, state: review.state, url: review.html_url, pullRequest: number }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+  });
+
+  registerAppTool(server, "github_resolve_review_thread", {
+    title: "Resolve a GitHub review thread",
+    description: "Use this only after explicit approval of the exact GitHub review-thread node ID. This marks an existing review thread resolved; it does not change code or merge the PR.",
+    inputSchema: { threadId: z.string().min(10).max(200) },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
+    _meta: { ui: { resourceUri: WIDGET_URI } },
+  }, async ({ threadId }): Promise<ToolResult> => {
+    const writeIdentity = requireGitHubWriteIdentity(identity);
+    const data = await githubGraphql<{ resolveReviewThread: { thread: { id: string; isResolved: boolean } } }>(`mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{id isResolved}}}`, { threadId }, writeIdentity);
+    return { content: [{ type: "text", text: `Resolved GitHub review thread ${threadId}.` }], structuredContent: { view: "github-review-thread", ...data.resolveReviewThread.thread }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+  });
+
+  registerAppTool(server, "github_run_sandboxed_tests", {
+    title: "Run tests in a sandbox",
+    description: "Use this when the user explicitly asks to run an allowlisted test command against supplied repository files. The server refuses unless an isolation wrapper is configured; it never runs a shell string.",
+    inputSchema: { files: z.array(z.object({ path: z.string().min(1).max(MAX_GITHUB_PATH_CHARS), content: z.string().max(MAX_GITHUB_PATCH_CHARS) })).min(1).max(MAX_GITHUB_PATCH_FILES), command: z.string().min(1).max(64), args: z.array(z.string().max(256)).max(32).default([]), timeoutMs: z.number().int().min(1000).max(120000).optional() },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: false },
+    _meta: { ui: { resourceUri: WIDGET_URI } },
+  }, async ({ files, command, args, timeoutMs }): Promise<ToolResult> => {
+    const result = await runSandboxedTest({ files, command, args, timeoutMs });
+    return { content: [{ type: "text", text: `${result.ok ? "Sandboxed test passed" : "Sandboxed test failed"} with exit code ${result.exitCode ?? "none"} in ${result.durationMs}ms.` }], structuredContent: { view: "sandbox-result", ...result }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+  });
+
+  registerAppTool(server, "ecg_plan_workflow", {
+    title: "Plan a ChatGPT coding workflow",
+    description: "Use this when the user wants ECG to choose relevant skills and lay out a safe multi-step coding workflow. Planning does not modify GitHub or execute code.",
+    inputSchema: { goal: z.string().min(1).max(4000), language: z.string().max(64).optional(), owner: z.string().max(128).optional(), repo: z.string().max(128).optional() },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
+    _meta: { ui: { resourceUri: WIDGET_URI } },
+  }, async ({ goal, language, owner, repo }): Promise<ToolResult> => {
+    const plan = planWorkflow(goal, language);
+    const catalog = buildCatalog();
+    const available = new Set(catalog.map((item) => item.id));
+    const steps = plan.steps.map((step) => ({ ...step, skillIds: step.skillIds.filter((id) => available.has(id)) }));
+    return { content: [{ type: "text", text: `Prepared a ${steps.length}-step ECG workflow. Read the selected skills before implementation; write steps remain approval-gated.` }], structuredContent: { view: "ecg-workflow-plan", goal, repository: owner && repo ? `${owner}/${repo}` : null, headline: plan.headline, steps, notes: plan.notes }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+  });
+
   registerAppTool(server, "github_propose_patch", {
     title: "Propose a GitHub patch",
     description: "Use this when the user wants a safe, reviewable patch proposal for a GitHub repository. This tool reads the current files, verifies expected SHAs, and does not modify GitHub.",
@@ -639,6 +759,7 @@ function createAppServer(identity?: GitHubIdentity): McpServer {
   }, async ({ owner, repo, baseRef, branchName, proposalId, changes }): Promise<ToolResult> => {
     const writeIdentity = requireGitHubWriteIdentity(identity);
     const repository = githubRepository(owner, repo);
+    assertRepositoryPolicy(repository, "write");
     const cleanBase = githubRef(baseRef);
     const cleanBranch = githubBranchName(branchName);
     const normalizedChanges = validatePatchChanges(changes);
@@ -691,6 +812,7 @@ function createAppServer(identity?: GitHubIdentity): McpServer {
   }, async ({ owner, repo, head, base, title, body, draft }): Promise<ToolResult> => {
     const writeIdentity = requireGitHubWriteIdentity(identity);
     const repository = githubRepository(owner, repo);
+    assertRepositoryPolicy(repository, "write");
     const cleanHead = githubBranchName(head);
     const cleanBase = githubBranchName(base);
     const pull = await githubApi<{ number: number; html_url: string; title: string; state: string; draft: boolean; head: { ref: string }; base: { ref: string } }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/pulls`, writeIdentity, { method: "POST", body: { title: title.trim(), head: cleanHead, base: cleanBase, body: body?.trim() ?? "", draft: Boolean(draft) } });
