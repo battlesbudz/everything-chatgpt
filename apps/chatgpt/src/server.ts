@@ -43,7 +43,7 @@ const OAUTH_ISSUER = (process.env.ECG_OAUTH_ISSUER?.trim() || PUBLIC_RESOURCE_UR
 const GITHUB_CLIENT_ID = process.env.GITHUB_OAUTH_CLIENT_ID?.trim() ?? "";
 const GITHUB_CLIENT_SECRET = process.env.GITHUB_OAUTH_CLIENT_SECRET?.trim() ?? "";
 const GITHUB_CALLBACK_URL = process.env.GITHUB_OAUTH_CALLBACK_URL?.trim() || `${PUBLIC_RESOURCE_URL}/oauth/github/callback`;
-const OAUTH_SCOPES = ["ecg:read", "ecg:write"] as const;
+const OAUTH_SCOPES = ["ecg:read"] as const;
 const OAUTH_CODE_TTL_MS = 5 * 60_000;
 const OAUTH_TOKEN_TTL_MS = 60 * 60_000;
 const OAUTH_REFRESH_TTL_MS = 30 * 24 * 60 * 60_000;
@@ -216,7 +216,7 @@ async function githubApi<T>(apiPath: string, identity?: GitHubIdentity, options:
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
     "x-github-api-version": "2022-11-28",
-    "user-agent": "everything-chatgpt/0.4.1",
+    "user-agent": "everything-chatgpt/0.4.2",
   };
   if (identity?.githubAccessToken) headers.authorization = `Bearer ${identity.githubAccessToken}`;
   if (options.body !== undefined) headers["content-type"] = "application/json";
@@ -235,8 +235,8 @@ function githubIdentityForTools(identity?: GitHubIdentity): GitHubIdentity | und
 }
 
 function requireGitHubWriteIdentity(identity?: GitHubIdentity): GitHubIdentity {
-  if (!identity?.githubAccessToken || !identity.ecgScope?.split(" ").includes("ecg:write")) {
-    throw new Error("GitHub write access is not authorized. Refresh ECG TOOL and approve the ecg:write permission before creating branches or pull requests.");
+  if (!identity?.githubAccessToken) {
+    throw new Error("GitHub write access is not authorized. Reconnect ECG TOOL and approve GitHub repository access before creating branches or pull requests.");
   }
   return identity;
 }
@@ -351,7 +351,7 @@ async function fallbackGitHubCodeSearch(repository: { owner: string; repo: strin
 }
 
 function createAppServer(identity?: GitHubIdentity): McpServer {
-  const server = new McpServer({ name: "everything-chatgpt", version: "0.4.1" }, {
+  const server = new McpServer({ name: "everything-chatgpt", version: "0.4.2" }, {
     instructions: "GitHub read tools are safe to use for inspection. Before creating a branch or pull request, obtain explicit user approval for the exact repository, branch, and proposed changes.",
   });
   registerAppResource(server, "ecg-catalog-widget", WIDGET_URI, {}, async () => appResource());
@@ -727,7 +727,6 @@ function oauthError(res: ServerResponse, status: number, error: string, descript
 function normalizeScope(scope: string | null): string {
   const requested = (scope ?? OAUTH_SCOPES.join(" ")).split(/\s+/).filter(Boolean);
   const normalized = new Set(requested.filter((item) => OAUTH_SCOPES.includes(item as typeof OAUTH_SCOPES[number])));
-  if (normalized.has("ecg:write")) normalized.add("ecg:read");
   return Array.from(normalized).join(" ") || OAUTH_SCOPES[0];
 }
 
