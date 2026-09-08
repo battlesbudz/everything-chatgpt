@@ -1,0 +1,1 @@
+Atomic test file B.
