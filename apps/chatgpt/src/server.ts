@@ -24,6 +24,11 @@ const MAX_GITHUB_RESULTS = 10;
 const MAX_GITHUB_TREE_ENTRIES = 200;
 const MAX_GITHUB_QUERY_CHARS = 256;
 const MAX_GITHUB_PATH_CHARS = 512;
+const MAX_GITHUB_COMMITS = 20;
+const MAX_GITHUB_DIFF_CHARS = 32_000;
+const MAX_GITHUB_PATCH_CHARS = 16_000;
+const MAX_GITHUB_PATCH_FILES = 10;
+const MAX_GITHUB_PATCH_TOTAL_CHARS = 64_000;
 const MAX_REQUEST_BYTES = 1_000_000;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX_REQUESTS = 120;
@@ -36,7 +41,7 @@ const OAUTH_ISSUER = (process.env.ECG_OAUTH_ISSUER?.trim() || PUBLIC_RESOURCE_UR
 const GITHUB_CLIENT_ID = process.env.GITHUB_OAUTH_CLIENT_ID?.trim() ?? "";
 const GITHUB_CLIENT_SECRET = process.env.GITHUB_OAUTH_CLIENT_SECRET?.trim() ?? "";
 const GITHUB_CALLBACK_URL = process.env.GITHUB_OAUTH_CALLBACK_URL?.trim() || `${PUBLIC_RESOURCE_URL}/oauth/github/callback`;
-const OAUTH_SCOPES = ["ecg:read"] as const;
+const OAUTH_SCOPES = ["ecg:read", "ecg:write"] as const;
 const OAUTH_CODE_TTL_MS = 5 * 60_000;
 const OAUTH_TOKEN_TTL_MS = 60 * 60_000;
 const OAUTH_REFRESH_TTL_MS = 30 * 24 * 60 * 60_000;
@@ -68,7 +73,7 @@ type ToolResult = {
   _meta?: Record<string, unknown>;
 };
 
-type GitHubIdentity = { id: number; login: string; name?: string | null; email?: string | null; githubAccessToken?: string };
+type GitHubIdentity = { id: number; login: string; name?: string | null; email?: string | null; githubAccessToken?: string; ecgScope?: string };
 type OAuthState = {
   clientId: string;
   redirectUri: string;
@@ -195,14 +200,25 @@ function githubRef(value: string | undefined): string {
   return ref;
 }
 
-async function githubApi<T>(apiPath: string, identity?: GitHubIdentity): Promise<T> {
+function githubBranchName(value: string): string {
+  const branch = value.trim();
+  if (!branch || branch.length > 256 || branch.startsWith("/") || branch.endsWith("/") || branch.includes("..") || branch.includes("//") || /[\u0000-\u001f\u007f ~^:?*[\\]/.test(branch)) {
+    throw new Error("Invalid GitHub branch name.");
+  }
+  return branch;
+}
+
+type GitHubRequestOptions = { method?: "GET" | "POST" | "PUT" | "DELETE"; body?: unknown };
+
+async function githubApi<T>(apiPath: string, identity?: GitHubIdentity, options: GitHubRequestOptions = {}): Promise<T> {
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
     "x-github-api-version": "2022-11-28",
-    "user-agent": "everything-chatgpt/0.3.0",
+    "user-agent": "everything-chatgpt/0.4.0",
   };
   if (identity?.githubAccessToken) headers.authorization = `Bearer ${identity.githubAccessToken}`;
-  const response = await fetch(`https://api.github.com${apiPath}`, { headers });
+  if (options.body !== undefined) headers["content-type"] = "application/json";
+  const response = await fetch(`https://api.github.com${apiPath}`, { method: options.method ?? "GET", headers, body: options.body === undefined ? undefined : JSON.stringify(options.body) });
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
     if (response.status === 401 || response.status === 403) throw new Error("GitHub authorization does not allow this repository or the GitHub rate limit was reached.");
@@ -216,8 +232,59 @@ function githubIdentityForTools(identity?: GitHubIdentity): GitHubIdentity | und
   return identity;
 }
 
+function requireGitHubWriteIdentity(identity?: GitHubIdentity): GitHubIdentity {
+  if (!identity?.githubAccessToken || !identity.ecgScope?.split(" ").includes("ecg:write")) {
+    throw new Error("GitHub write access is not authorized. Refresh ECG TOOL and approve the ecg:write permission before creating branches or pull requests.");
+  }
+  return identity;
+}
+
+type PatchOperation = "create" | "update" | "delete";
+type PatchChange = { path: string; operation: PatchOperation; content?: string; expectedSha?: string };
+
+function validatePatchChanges(changes: PatchChange[]): PatchChange[] {
+  if (changes.length < 1 || changes.length > MAX_GITHUB_PATCH_FILES) throw new Error(`A patch proposal must contain between 1 and ${MAX_GITHUB_PATCH_FILES} files.`);
+  const seen = new Set<string>();
+  let totalChars = 0;
+  return changes.map((change) => {
+    const cleanPath = githubFilePath(change.path);
+    if (seen.has(cleanPath)) throw new Error(`Patch contains the file more than once: ${cleanPath}`);
+    seen.add(cleanPath);
+    const content = change.operation === "delete" ? undefined : change.content ?? "";
+    if ((content?.length ?? 0) > MAX_GITHUB_PATCH_CHARS) throw new Error(`Patch content exceeds ${MAX_GITHUB_PATCH_CHARS.toLocaleString()} characters: ${cleanPath}`);
+    if (change.operation !== "create" && !change.expectedSha) throw new Error(`Patch operation ${change.operation} requires expectedSha for ${cleanPath}.`);
+    if (change.operation === "create" && change.expectedSha) throw new Error(`Create operation must not include expectedSha: ${cleanPath}`);
+    totalChars += content?.length ?? 0;
+    if (totalChars > MAX_GITHUB_PATCH_TOTAL_CHARS) throw new Error(`Patch proposal exceeds ${MAX_GITHUB_PATCH_TOTAL_CHARS.toLocaleString()} total content characters.`);
+    return { path: cleanPath, operation: change.operation, ...(content === undefined ? {} : { content }), ...(change.expectedSha ? { expectedSha: change.expectedSha } : {}) };
+  });
+}
+
+function previewPatch(pathname: string, operation: PatchOperation, previous: string, next: string): string {
+  const oldLines = previous ? previous.split("\n") : [];
+  const newLines = next ? next.split("\n") : [];
+  const oldPreview = oldLines.slice(0, 120).map((line) => `-${line}`).join("\n");
+  const newPreview = newLines.slice(0, 120).map((line) => `+${line}`).join("\n");
+  const omitted = oldLines.length > 120 || newLines.length > 120 ? "\n... preview truncated ..." : "";
+  return [`--- ${operation === "create" ? "/dev/null" : `a/${pathname}`}`, `+++ ${operation === "delete" ? "/dev/null" : `b/${pathname}`}`, "@@", oldPreview, newPreview].filter(Boolean).join("\n") + omitted;
+}
+
+async function readGitHubTextFile(owner: string, repo: string, pathname: string, ref: string, identity?: GitHubIdentity): Promise<{ content: string; sha: string } | undefined> {
+  try {
+    const query = ref ? `?ref=${encodeURIComponent(ref)}` : "";
+    const payload = await githubApi<{ type: string; encoding: string; content?: string; sha: string }>(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${pathname.split("/").map(encodeURIComponent).join("/")}${query}`, identity);
+    if (payload.type !== "file" || payload.encoding !== "base64" || typeof payload.content !== "string") throw new Error(`GitHub path is not a text file: ${pathname}`);
+    return { content: Buffer.from(payload.content.replace(/\s/g, ""), "base64").toString("utf8"), sha: payload.sha };
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("GitHub repository or resource was not found")) return undefined;
+    throw error;
+  }
+}
+
 function createAppServer(identity?: GitHubIdentity): McpServer {
-  const server = new McpServer({ name: "everything-chatgpt", version: "0.3.0" });
+  const server = new McpServer({ name: "everything-chatgpt", version: "0.4.0" }, {
+    instructions: "GitHub read tools are safe to use for inspection. Before creating a branch or pull request, obtain explicit user approval for the exact repository, branch, and proposed changes.",
+  });
   registerAppResource(server, "ecg-catalog-widget", WIDGET_URI, {}, async () => appResource());
 
   registerAppTool(server, "ecg_overview", {
@@ -368,6 +435,172 @@ function createAppServer(identity?: GitHubIdentity): McpServer {
     return { content: [{ type: "text", text: `GitHub file ${payload.path}${truncated ? ` (first ${MAX_FILE_CHARS.toLocaleString()} characters)` : ""}\n\n${content}` }], structuredContent: { view: "github-file", headline: `${repository.owner}/${repository.repo}/${payload.path}`, path: payload.path, ref: cleanRef || "default", sha: payload.sha, content, truncated, url: payload.html_url ?? null }, _meta: { "openai/outputTemplate": WIDGET_URI } };
   });
 
+  registerAppTool(server, "github_list_commits", {
+    title: "Read GitHub commit history",
+    description: "Use this when the user wants to review recent commits in a GitHub repository or the history of a specific path. This is read-only.",
+    inputSchema: {
+      owner: z.string().min(1).max(128).describe("GitHub owner or organization login."),
+      repo: z.string().min(1).max(128).describe("GitHub repository name."),
+      ref: z.string().max(256).optional().describe("Optional branch, tag, or commit SHA."),
+      path: z.string().max(MAX_GITHUB_PATH_CHARS).optional().describe("Optional file or directory path to filter history."),
+      limit: z.number().int().min(1).max(MAX_GITHUB_COMMITS).optional().describe(`Maximum commits to return, up to ${MAX_GITHUB_COMMITS}.`),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true },
+    _meta: { ui: { resourceUri: WIDGET_URI }, "openai/toolInvocation/invoking": "Reading GitHub commit history", "openai/toolInvocation/invoked": "GitHub commit history ready" },
+  }, async ({ owner, repo, ref, path: requestedPath, limit }): Promise<ToolResult> => {
+    const repository = githubRepository(owner, repo);
+    const cleanRef = githubRef(ref);
+    const cleanPath = requestedPath ? githubFilePath(requestedPath) : "";
+    const params = new URLSearchParams({ per_page: String(limit ?? MAX_GITHUB_COMMITS) });
+    if (cleanRef) params.set("sha", cleanRef);
+    if (cleanPath) params.set("path", cleanPath);
+    const commits = await githubApi<Array<{ sha: string; html_url: string; commit: { message: string; author?: { name?: string; date?: string } | null }; author?: { login: string } | null }>>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/commits?${params.toString()}`, githubIdentityForTools(identity));
+    const results = commits.slice(0, limit ?? MAX_GITHUB_COMMITS).map((item) => ({ sha: item.sha, url: item.html_url, message: item.commit.message.split("\n")[0].slice(0, 240), author: item.author?.login ?? item.commit.author?.name ?? "unknown", date: item.commit.author?.date ?? null }));
+    return { content: [{ type: "text", text: `Found ${results.length} GitHub commit(s) for ${repository.owner}/${repository.repo}.` }], structuredContent: { view: "github-commits", headline: `${repository.owner}/${repository.repo} commits`, ref: cleanRef || "default", path: cleanPath || null, results }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+  });
+
+  registerAppTool(server, "github_compare_commits", {
+    title: "Compare GitHub commits",
+    description: "Use this when the user wants to review the diff between two GitHub branches, tags, or commit SHAs. This is read-only and returns a bounded diff.",
+    inputSchema: {
+      owner: z.string().min(1).max(128).describe("GitHub owner or organization login."),
+      repo: z.string().min(1).max(128).describe("GitHub repository name."),
+      base: z.string().min(1).max(256).describe("Base branch, tag, or commit SHA."),
+      head: z.string().min(1).max(256).describe("Head branch, tag, or commit SHA."),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true },
+    _meta: { ui: { resourceUri: WIDGET_URI }, "openai/toolInvocation/invoking": "Comparing GitHub commits", "openai/toolInvocation/invoked": "GitHub diff ready" },
+  }, async ({ owner, repo, base, head }): Promise<ToolResult> => {
+    const repository = githubRepository(owner, repo);
+    const cleanBase = githubRef(base);
+    const cleanHead = githubRef(head);
+    if (!cleanBase || !cleanHead) throw new Error("Both base and head refs are required.");
+    const payload = await githubApi<{ status: string; ahead_by: number; behind_by: number; total_commits: number; html_url: string; commits: Array<{ sha: string; commit: { message: string } }>; files?: Array<{ filename: string; status: string; additions: number; deletions: number; changes: number; patch?: string | null; blob_url?: string }> }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/compare/${encodeURIComponent(cleanBase)}...${encodeURIComponent(cleanHead)}`, githubIdentityForTools(identity));
+    let remaining = MAX_GITHUB_DIFF_CHARS;
+    const files = (payload.files ?? []).map((file) => {
+      const patch = (file.patch ?? "").slice(0, Math.max(0, remaining));
+      remaining -= patch.length;
+      return { filename: file.filename, status: file.status, additions: file.additions, deletions: file.deletions, changes: file.changes, patch, truncated: Boolean(file.patch && patch.length < file.patch.length), url: file.blob_url ?? null };
+    });
+    return { content: [{ type: "text", text: `Compared ${repository.owner}/${repository.repo}: ${cleanBase} to ${cleanHead}.` }], structuredContent: { view: "github-diff", headline: `${repository.owner}/${repository.repo}: ${cleanBase} → ${cleanHead}`, url: payload.html_url, status: payload.status, aheadBy: payload.ahead_by, behindBy: payload.behind_by, totalCommits: payload.total_commits, commits: payload.commits.slice(0, MAX_GITHUB_COMMITS).map((commit) => ({ sha: commit.sha, message: commit.commit.message.split("\n")[0].slice(0, 240) })), files, truncated: remaining <= 0 }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+  });
+
+  registerAppTool(server, "github_search_code", {
+    title: "Search GitHub repository content",
+    description: "Use this when the user wants to find text or symbols inside a specific GitHub repository. This is read-only and uses GitHub code-search qualifiers.",
+    inputSchema: {
+      owner: z.string().min(1).max(128).describe("GitHub owner or organization login."),
+      repo: z.string().min(1).max(128).describe("GitHub repository name."),
+      query: z.string().min(1).max(MAX_GITHUB_QUERY_CHARS).describe("Text, symbol, or GitHub code-search qualifier to find."),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true },
+    _meta: { ui: { resourceUri: WIDGET_URI }, "openai/toolInvocation/invoking": "Searching GitHub code", "openai/toolInvocation/invoked": "GitHub code search complete" },
+  }, async ({ owner, repo, query }): Promise<ToolResult> => {
+    const repository = githubRepository(owner, repo);
+    const trimmed = query.trim();
+    const payload = await githubApi<{ total_count: number; incomplete_results: boolean; items: Array<{ name: string; path: string; sha: string; html_url: string; repository?: { full_name: string } }> }>(`/search/code?q=${encodeURIComponent(`${trimmed} repo:${repository.owner}/${repository.repo}`)}&per_page=${MAX_GITHUB_RESULTS}`, githubIdentityForTools(identity));
+    const results = payload.items.slice(0, MAX_GITHUB_RESULTS).map((item) => ({ name: item.name, path: item.path, sha: item.sha, url: item.html_url, repository: item.repository?.full_name ?? `${repository.owner}/${repository.repo}` }));
+    return { content: [{ type: "text", text: `Found ${results.length} GitHub code result(s) for “${trimmed}”.` }], structuredContent: { view: "github-code-search", headline: `${repository.owner}/${repository.repo}: ${trimmed}`, totalCount: payload.total_count, incomplete: payload.incomplete_results, results }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+  });
+
+  registerAppTool(server, "github_propose_patch", {
+    title: "Propose a GitHub patch",
+    description: "Use this when the user wants a safe, reviewable patch proposal for a GitHub repository. This tool reads the current files, verifies expected SHAs, and does not modify GitHub.",
+    inputSchema: {
+      owner: z.string().min(1).max(128).describe("GitHub owner or organization login."),
+      repo: z.string().min(1).max(128).describe("GitHub repository name."),
+      baseRef: z.string().max(256).optional().describe("Branch, tag, or commit SHA to base the proposal on."),
+      changes: z.array(z.object({ path: z.string().min(1).max(MAX_GITHUB_PATH_CHARS), operation: z.enum(["create", "update", "delete"]), content: z.string().max(MAX_GITHUB_PATCH_CHARS).optional(), expectedSha: z.string().max(128).optional() })).min(1).max(MAX_GITHUB_PATCH_FILES),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true },
+    _meta: { ui: { resourceUri: WIDGET_URI }, "openai/toolInvocation/invoking": "Building a safe GitHub patch proposal", "openai/toolInvocation/invoked": "GitHub patch proposal ready" },
+  }, async ({ owner, repo, baseRef, changes }): Promise<ToolResult> => {
+    const repository = githubRepository(owner, repo);
+    const cleanRef = githubRef(baseRef);
+    const repositoryInfo = await githubApi<{ default_branch: string }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}`, githubIdentityForTools(identity));
+    const effectiveBaseRef = cleanRef || repositoryInfo.default_branch;
+    const normalizedChanges = validatePatchChanges(changes);
+    const proposalChanges = [];
+    for (const change of normalizedChanges) {
+      const current = await readGitHubTextFile(repository.owner, repository.repo, change.path, effectiveBaseRef, githubIdentityForTools(identity));
+      if (change.operation === "create" && current) throw new Error(`Cannot create ${change.path}: the file already exists.`);
+      if (change.operation !== "create" && !current) throw new Error(`Cannot ${change.operation} ${change.path}: the file does not exist at the selected ref.`);
+      if (change.expectedSha && current?.sha !== change.expectedSha) throw new Error(`SHA mismatch for ${change.path}; the file changed since it was inspected.`);
+      const next = change.operation === "delete" ? "" : change.content ?? "";
+      proposalChanges.push({ path: change.path, operation: change.operation, ...(current?.sha ? { expectedSha: current.sha } : {}), ...(change.operation === "delete" ? {} : { content: next }), patch: previewPatch(change.path, change.operation, current?.content ?? "", next) });
+    }
+    const proposalHashChanges = proposalChanges.map(({ patch: _patch, ...change }) => change);
+    const proposalId = crypto.createHash("sha256").update(JSON.stringify({ owner: repository.owner, repo: repository.repo, baseRef: effectiveBaseRef, changes: proposalHashChanges })).digest("hex");
+    return { content: [{ type: "text", text: `Prepared patch proposal ${proposalId.slice(0, 12)} for ${repository.owner}/${repository.repo}. No GitHub files were changed.` }], structuredContent: { view: "github-patch-proposal", headline: `Patch proposal: ${repository.owner}/${repository.repo}`, proposalId, owner: repository.owner, repo: repository.repo, baseRef: effectiveBaseRef, changes: proposalChanges }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+  });
+
+  registerAppTool(server, "github_create_branch", {
+    title: "Create a GitHub branch from a patch",
+    description: "Use this only after the user explicitly approves the exact patch proposal. It creates a new non-default branch and applies the approved bounded changes; it never writes directly to the default branch.",
+    inputSchema: {
+      owner: z.string().min(1).max(128).describe("GitHub owner or organization login."),
+      repo: z.string().min(1).max(128).describe("GitHub repository name."),
+      baseRef: z.string().min(1).max(256).describe("Base branch, tag, or commit SHA."),
+      branchName: z.string().min(1).max(256).describe("New branch name; do not use the repository default branch."),
+      proposalId: z.string().length(64).describe("SHA-256 proposal ID returned by github_propose_patch."),
+      changes: z.array(z.object({ path: z.string().min(1).max(MAX_GITHUB_PATH_CHARS), operation: z.enum(["create", "update", "delete"]), content: z.string().max(MAX_GITHUB_PATCH_CHARS).optional(), expectedSha: z.string().max(128).optional() })).min(1).max(MAX_GITHUB_PATCH_FILES),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
+    _meta: { ui: { resourceUri: WIDGET_URI }, "openai/toolInvocation/invoking": "Creating an approved GitHub branch", "openai/toolInvocation/invoked": "GitHub branch created" },
+  }, async ({ owner, repo, baseRef, branchName, proposalId, changes }): Promise<ToolResult> => {
+    const writeIdentity = requireGitHubWriteIdentity(identity);
+    const repository = githubRepository(owner, repo);
+    const cleanBase = githubRef(baseRef);
+    const cleanBranch = githubBranchName(branchName);
+    const normalizedChanges = validatePatchChanges(changes);
+    const proposalIdCheck = crypto.createHash("sha256").update(JSON.stringify({ owner: repository.owner, repo: repository.repo, baseRef: cleanBase, changes: normalizedChanges })).digest("hex");
+    if (proposalIdCheck !== proposalId) throw new Error("The supplied changes do not match the approved proposal ID. Re-run github_propose_patch against the current repository state.");
+    const repositoryInfo = await githubApi<{ default_branch: string }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}`, writeIdentity);
+    if (cleanBranch === repositoryInfo.default_branch) throw new Error("ECG will not write a patch directly to the repository default branch.");
+    const base = await githubApi<{ object: { sha: string } }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/git/ref/heads/${encodeURIComponent(cleanBase)}`, writeIdentity);
+    await githubApi(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/git/refs`, writeIdentity, { method: "POST", body: { ref: `refs/heads/${cleanBranch}`, sha: base.object.sha } });
+    const applied: string[] = [];
+    try {
+      for (const change of normalizedChanges) {
+        const contentPath = change.path.split("/").map(encodeURIComponent).join("/");
+        const endpoint = `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/contents/${contentPath}`;
+        if (change.operation === "delete") {
+          await githubApi(endpoint, writeIdentity, { method: "DELETE", body: { message: `ECG: delete ${change.path}`, branch: cleanBranch, sha: change.expectedSha } });
+        } else {
+          await githubApi(endpoint, writeIdentity, { method: "PUT", body: { message: `ECG: ${change.operation} ${change.path}`, branch: cleanBranch, content: Buffer.from(change.content ?? "", "utf8").toString("base64"), ...(change.expectedSha ? { sha: change.expectedSha } : {}) } });
+        }
+        applied.push(change.path);
+      }
+    } catch (error) {
+      logEvent("github.branch_partial", { owner: repository.owner, repo: repository.repo, branch: cleanBranch, proposalId, applied, error: error instanceof Error ? error.message : String(error) });
+      throw new Error(`Branch ${cleanBranch} was created, but applying the approved patch stopped after ${applied.length} file(s). Inspect the branch before retrying.`);
+    }
+    return { content: [{ type: "text", text: `Created branch ${cleanBranch} from ${cleanBase} and applied ${applied.length} approved file change(s).` }], structuredContent: { view: "github-branch", headline: `${repository.owner}/${repository.repo}:${cleanBranch}`, owner: repository.owner, repo: repository.repo, branchName: cleanBranch, baseRef: cleanBase, proposalId, applied }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+  });
+
+  registerAppTool(server, "github_create_pull_request", {
+    title: "Create a GitHub pull request",
+    description: "Use this only after the user explicitly approves the exact source branch, target branch, title, and PR body. It creates a pull request and does not merge it.",
+    inputSchema: {
+      owner: z.string().min(1).max(128).describe("GitHub owner or organization login."),
+      repo: z.string().min(1).max(128).describe("GitHub repository name."),
+      head: z.string().min(1).max(256).describe("Existing source branch containing the approved changes."),
+      base: z.string().min(1).max(256).describe("Target branch, normally the repository default branch."),
+      title: z.string().min(1).max(256).describe("Pull request title."),
+      body: z.string().max(16_000).optional().describe("Pull request description."),
+      draft: z.boolean().optional().describe("Create as a draft pull request when true."),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
+    _meta: { ui: { resourceUri: WIDGET_URI }, "openai/toolInvocation/invoking": "Creating an approved GitHub pull request", "openai/toolInvocation/invoked": "GitHub pull request created" },
+  }, async ({ owner, repo, head, base, title, body, draft }): Promise<ToolResult> => {
+    const writeIdentity = requireGitHubWriteIdentity(identity);
+    const repository = githubRepository(owner, repo);
+    const cleanHead = githubBranchName(head);
+    const cleanBase = githubBranchName(base);
+    const pull = await githubApi<{ number: number; html_url: string; title: string; state: string; draft: boolean; head: { ref: string }; base: { ref: string } }>(`/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/pulls`, writeIdentity, { method: "POST", body: { title: title.trim(), head: cleanHead, base: cleanBase, body: body?.trim() ?? "", draft: Boolean(draft) } });
+    return { content: [{ type: "text", text: `Created GitHub pull request #${pull.number}: ${pull.title}. It was not merged.` }], structuredContent: { view: "github-pull-request", headline: `PR #${pull.number}: ${pull.title}`, number: pull.number, url: pull.html_url, state: pull.state, draft: pull.draft, head: pull.head.ref, base: pull.base.ref }, _meta: { "openai/outputTemplate": WIDGET_URI } };
+  });
+
   return server;
 }
 
@@ -404,7 +637,9 @@ function oauthError(res: ServerResponse, status: number, error: string, descript
 
 function normalizeScope(scope: string | null): string {
   const requested = (scope ?? OAUTH_SCOPES.join(" ")).split(/\s+/).filter(Boolean);
-  return Array.from(new Set(requested.filter((item) => OAUTH_SCOPES.includes(item as typeof OAUTH_SCOPES[number])))).join(" ") || OAUTH_SCOPES[0];
+  const normalized = new Set(requested.filter((item) => OAUTH_SCOPES.includes(item as typeof OAUTH_SCOPES[number])));
+  if (normalized.has("ecg:write")) normalized.add("ecg:read");
+  return Array.from(normalized).join(" ") || OAUTH_SCOPES[0];
 }
 
 function isAllowedOAuthRedirect(uri: string): boolean {
@@ -551,7 +786,7 @@ async function handleOAuth(req: IncomingMessage, res: ServerResponse, url: URL):
     const github = new URL("https://github.com/login/oauth/authorize");
     github.searchParams.set("client_id", GITHUB_CLIENT_ID);
     github.searchParams.set("redirect_uri", GITHUB_CALLBACK_URL);
-    github.searchParams.set("scope", "read:user user:email");
+    github.searchParams.set("scope", "read:user user:email public_repo");
     github.searchParams.set("state", oauthState);
     res.writeHead(302, { location: github.toString() }).end();
     return true;
@@ -601,8 +836,9 @@ async function handleOAuth(req: IncomingMessage, res: ServerResponse, url: URL):
       pending.used = true;
       const accessToken = randomToken();
       const refreshToken = randomToken();
-      oauthAccessTokens.set(accessToken, { identity: pending.identity, scope: pending.scope, resource, expiresAt: Date.now() + OAUTH_TOKEN_TTL_MS });
-      oauthRefreshTokens.set(refreshToken, { identity: pending.identity, scope: pending.scope, resource, expiresAt: Date.now() + OAUTH_REFRESH_TTL_MS });
+      const identity = { ...pending.identity, ecgScope: pending.scope };
+      oauthAccessTokens.set(accessToken, { identity, scope: pending.scope, resource, expiresAt: Date.now() + OAUTH_TOKEN_TTL_MS });
+      oauthRefreshTokens.set(refreshToken, { identity, scope: pending.scope, resource, expiresAt: Date.now() + OAUTH_REFRESH_TTL_MS });
       sendJson(res, 200, { token_type: "Bearer", access_token: accessToken, expires_in: OAUTH_TOKEN_TTL_MS / 1000, refresh_token: refreshToken, scope: pending.scope });
       return true;
     }
