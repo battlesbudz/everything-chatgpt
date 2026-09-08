@@ -24,7 +24,7 @@ This is an interactive-decoupled app: the MCP server owns the catalog and the wi
 
 The server only exposes a bounded set of ECG documentation paths. It rejects traversal attempts and truncates returned files to keep tool responses manageable.
 
-The service applies request-size and per-client rate limits, structured request logs, security headers, and an allowlist-based CORS policy. `ECG_ACCESS_TOKEN` remains available as a local/private fallback. For ChatGPT, use the OAuth 2.1 mode described below; it provides MCP protected-resource metadata, PKCE, GitHub identity, short-lived access tokens, and `ecg:read`/`ecg:write` scopes. The GitHub OAuth flow requests `read:user user:email public_repo`: public-repository branch and PR writes are supported after explicit approval; private-repository access should move to a fine-grained GitHub App before production use.
+The service applies request-size and per-client rate limits, structured request logs, security headers, and an allowlist-based CORS policy. `ECG_ACCESS_TOKEN` remains available as a local/private fallback. For ChatGPT, use the OAuth 2.1 mode described below; it provides MCP protected-resource metadata, PKCE, GitHub identity, and short-lived access tokens. The GitHub OAuth flow requests `read:user user:email public_repo`: public-repository branch and PR writes are supported after explicit approval; private-repository access should move to a fine-grained GitHub App before production use.
 
 ## OAuth configuration
 
@@ -40,7 +40,7 @@ GITHUB_OAUTH_CLIENT_SECRET=<stored in Render, never committed>
 GITHUB_OAUTH_CALLBACK_URL=https://everything-chatgpt.onrender.com/oauth/github/callback
 ```
 
-Create a GitHub OAuth App with the callback URL above. The initial scope is limited to `read:user user:email`; it does not grant repository write access or private-repository access. The MCP endpoint advertises `ecg:read` and returns a `WWW-Authenticate` resource-metadata challenge when a request is unauthenticated.
+Create a GitHub OAuth App with the callback URL above. The GitHub authorization request includes `read:user user:email public_repo`, which supports public-repository branch and PR writes after explicit user approval. The MCP endpoint advertises `ecg:read` for connector authentication; write authorization is enforced by the presence of the authenticated GitHub token and GitHub’s own repository permissions, not by an invisible custom `ecg:write` connector permission.
 
 The current OAuth transaction and token stores are in memory. That is suitable for the first authenticated read-only test, but production use still requires a durable encrypted session/token store before relying on Render restarts or multiple instances.
 
