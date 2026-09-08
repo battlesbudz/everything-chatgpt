@@ -17,7 +17,7 @@ This is an interactive-decoupled app: the MCP server owns the catalog and the wi
 - `github_read_file` — read a bounded text file without executing it.
 - `github_list_commits` — read recent commit history, optionally filtered by path.
 - `github_compare_commits` — read a bounded diff between two refs.
-- `github_search_code` — search content inside a repository; GitHub may require authenticated code-search access.
+- `github_search_code` — search content inside a repository; if GitHub returns an incomplete zero-result response or rejects code search, ECG falls back to a bounded scan of likely text files and reports that fallback in the result.
 - `github_propose_patch` — validate expected file SHAs and produce a reviewable patch preview without writing.
 - `github_create_branch` — after explicit approval, create a non-default branch and apply the approved patch.
 - `github_create_pull_request` — after explicit approval, open a PR without merging it.
