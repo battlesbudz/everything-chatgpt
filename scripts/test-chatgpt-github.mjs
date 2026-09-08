@@ -46,6 +46,12 @@ if (comparison.structuredContent?.status !== "identical") throw new Error("same-
 const codeSearch = await call("tools/call", { name: "github_search_code", arguments: { owner, repo, query: "github_create_pull_request" } });
 if (!codeSearch.isError && (!Array.isArray(codeSearch.structuredContent?.results) || (codeSearch.structuredContent.results.length === 0 && !codeSearch.structuredContent?.fallbackUsed))) throw new Error("code search returned neither results nor a bounded fallback result");
 
+const workflow = await call("tools/call", { name: "ecg_plan_workflow", arguments: { goal: "Review and test the GitHub pull request safely", language: "TypeScript", owner, repo } });
+if (!Array.isArray(workflow.structuredContent?.steps) || workflow.structuredContent.steps.length < 3) throw new Error("workflow planner did not return ordered steps");
+
+const sandboxAttempt = await call("tools/call", { name: "github_run_sandboxed_tests", arguments: { files: [{ path: "package.json", content: "{}" }], command: "npm", args: ["test"] } });
+if (!sandboxAttempt.isError) throw new Error("sandbox execution unexpectedly ran without the required isolation configuration");
+
 const proposal = await call("tools/call", {
   name: "github_propose_patch",
   arguments: { owner, repo, baseRef: "main", changes: [{ path: "apps/chatgpt/ecg-smoke-fixture.txt", operation: "create", content: "ECG proposal fixture\n" }] },
@@ -58,4 +64,4 @@ const writeAttempt = await call("tools/call", {
 });
 if (!writeAttempt.isError) throw new Error("unauthenticated local server unexpectedly allowed branch creation");
 
-console.log(JSON.stringify({ ok: true, repository: repository.structuredContent.repository.fullName, treeEntries: tree.structuredContent.entries.length, fileChars: file.structuredContent.content.length, searchResults: search.structuredContent.results.length, commits: commits.structuredContent.results.length, codeResults: codeSearch.structuredContent?.results?.length ?? 0, codeSearchFallbackUsed: Boolean(codeSearch.structuredContent?.fallbackUsed), codeSearchRequiresAuth: Boolean(codeSearch.isError), proposalId: proposal.structuredContent.proposalId, writeBlocked: true }));
+console.log(JSON.stringify({ ok: true, repository: repository.structuredContent.repository.fullName, treeEntries: tree.structuredContent.entries.length, fileChars: file.structuredContent.content.length, searchResults: search.structuredContent.results.length, commits: commits.structuredContent.results.length, codeResults: codeSearch.structuredContent?.results?.length ?? 0, codeSearchFallbackUsed: Boolean(codeSearch.structuredContent?.fallbackUsed), codeSearchRequiresAuth: Boolean(codeSearch.isError), workflowSteps: workflow.structuredContent.steps.length, sandboxBlocked: true, proposalId: proposal.structuredContent.proposalId, writeBlocked: true }));
