@@ -19,7 +19,7 @@ This is an interactive-decoupled app: the MCP server owns the catalog and the wi
 - `github_compare_commits` — read a bounded diff between two refs.
 - `github_search_code` — search content inside a repository; if GitHub returns an incomplete zero-result response or rejects code search, ECG falls back to a bounded scan of likely text files and reports that fallback in the result.
 - `github_propose_patch` — validate expected file SHAs and produce a reviewable patch preview without writing.
-- `github_create_branch` — after explicit approval, create a non-default branch and apply the approved patch.
+- `github_create_branch` — after explicit approval, create a non-default branch and apply the approved patch as one atomic commit; stale proposals are rejected before any GitHub write.
 - `github_create_pull_request` — after explicit approval, open a PR without merging it.
 
 The server only exposes a bounded set of ECG documentation paths. It rejects traversal attempts and truncates returned files to keep tool responses manageable.
